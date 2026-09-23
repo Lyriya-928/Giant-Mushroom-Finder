@@ -57,8 +57,8 @@ Cubiomes (biome generation)
 
 依赖：
 
-- MinGW-w64 GCC（本机通过 winget 安装了 WinLibs）
-- JDK 17+（开发机使用 JDK 26）
+- MinGW-w64 GCC
+- JDK 17+
 - make（mingw32-make）
 
 ```powershell
