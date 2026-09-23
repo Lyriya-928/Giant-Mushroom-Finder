@@ -1,4 +1,5 @@
 # Giant Mushroom Island Finder
+English(README.md) | [简体中文]
 
 一个用于寻找 Minecraft Java Edition **蘑菇岛（Mushroom Fields）** 的独立 Java 桌面工具。
 
