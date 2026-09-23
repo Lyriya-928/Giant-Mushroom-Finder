@@ -1,4 +1,5 @@
 # Giant Mushroom Island Finder
+English | [简体中文](README.zh-CN.md)
 
 A standalone Java desktop application for finding large **Mushroom Fields** in Minecraft Java Edition.
 
