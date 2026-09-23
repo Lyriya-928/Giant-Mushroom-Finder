@@ -1,0 +1,40 @@
+# Build outputs
+build/
+bin/
+out/
+dist/
+*.o
+*.a
+*.obj
+*.lib
+*.dll
+*.exe
+*.class
+*.jar
+*.log
+*.tmp
+*.bak
+*.csv
+*.json
+!**/package.json
+
+# Native / Java
+hs_err_pid*
+replay_pid*
+
+# IDE / editor
+.idea/
+*.iml
+.vscode/
+.vs/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+*.local
+
+# Do not commit nested VCS metadata if reintroduced
+**/.git/

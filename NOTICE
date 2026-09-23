@@ -1,0 +1,34 @@
+# Third-party notices
+
+## Cubiomes
+
+Path: `cubiomes/`
+Source: https://github.com/Cubitect/cubiomes
+License: MIT (see `cubiomes/LICENSE`)
+Copyright (c) 2020 Cubitect
+
+Used as-is (vendored source) for Minecraft Java Edition biome / world
+generation. This project does not modify Cubiomes sources.
+
+## Architecture references (no source code copied)
+
+The following projects inspired the Java + JNI + native search layout,
+search lifecycle (pause/resume/stop), and biome-region search workflow.
+No source code from these repositories is included in this tree.
+
+### SunnySlopes / FortressFinderGUI
+https://github.com/SunnySlopes/FortressFinderGUI
+Used as reference for Java GUI + JNI + native worker lifecycle.
+
+### SunnySlopes / RiverFinderGUI
+https://github.com/SunnySlopes/RiverFinderGUI
+Used as reference for biome-region search architecture.
+
+### SunnySlopes / SlimeFinderGUI
+https://github.com/SunnySlopes/SlimeFinderGUI
+Used as reference for Java/native search organization.
+
+### Cubitect / cubiomes-viewer
+https://github.com/Cubitect/cubiomes-viewer
+Used as reference for seed-finding workflows and verification ideas
+(algorithm verification tool; not redistributed here).
