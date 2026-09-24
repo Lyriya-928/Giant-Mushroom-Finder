@@ -18,9 +18,8 @@ dist/
 *.json
 !**/package.json
 
-# Native / Java
-hs_err_pid*
-replay_pid*
+# Generated embedded native (copied from build/gmif.dll by build.ps1)
+src/main/resources/native/**/*.dll
 
 # IDE / editor
 .idea/
@@ -36,5 +35,5 @@ Thumbs.db
 .env
 *.local
 
-# Do not commit nested VCS metadata if reintroduced
+# Nested VCS metadata
 **/.git/

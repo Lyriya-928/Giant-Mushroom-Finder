@@ -65,7 +65,7 @@ $(OUT_DIR)/release_audit.o: $(NATIVE_DIR)/release_audit.c $(NATIVE_DIR)/mushroom
 $(OUT_DIR)/mushroom_cli.o: $(NATIVE_DIR)/mushroom_cli.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OUT_DIR)/mushroomfinder.dll: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a
+$(OUT_DIR)/gmif.dll: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a
 	$(CC) -shared -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS)
 
 # audit is CLI-only (not linked into DLL)
@@ -73,7 +73,9 @@ $(OUT_DIR)/mushroomfinder.dll: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_sear
 $(OUT_DIR)/mushroom_finder_JNI.o: $(NATIVE_DIR)/mushroom_finder_JNI.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(JNI_INC) -c $< -o $@
 
-native: $(OUT_DIR)/mushroomfinder.dll
+native: $(OUT_DIR)/gmif.dll
+	@if not exist src\main\resources\native\windows-x86_64 mkdir src\main\resources\native\windows-x86_64
+	copy /Y $(OUT_DIR)\gmif.dll src\main\resources\native\windows-x86_64\gmif.dll
 
 $(OUT_DIR):
 	mkdir $(OUT_DIR)
@@ -82,11 +84,24 @@ $(JAVA_OUT): | $(OUT_DIR)
 	mkdir $(JAVA_OUT)
 
 jar: native $(JAVA_OUT)
-	$(JAVAC) -encoding UTF-8 -d $(JAVA_OUT) $(JAVA_SRC)/$(JAVA_PKG)/Main.java $(JAVA_SRC)/$(JAVA_PKG)/MainFrame.java $(JAVA_SRC)/$(JAVA_PKG)/NativeBridge.java $(JAVA_SRC)/$(JAVA_PKG)/NativeLoader.java $(JAVA_SRC)/$(JAVA_PKG)/SearchRunner.java $(JAVA_SRC)/$(JAVA_PKG)/SearchSettings.java $(JAVA_SRC)/$(JAVA_PKG)/SearchResult.java $(JAVA_SRC)/$(JAVA_PKG)/SelfTest.java
-	$(JAR) cfe $(OUT_DIR)/GiantMushroomFinder.jar dev.sakuhime.mushroomfinder.Main -C $(JAVA_OUT) .
+	$(JAVAC) -encoding UTF-8 -d $(JAVA_OUT) \
+		$(JAVA_SRC)/$(JAVA_PKG)/AppInfo.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/Main.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/MainFrame.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/I18n.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/NativeBridge.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/NativeLoader.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/RadiusValidator.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/SearchRunner.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/SearchSettings.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/SearchResult.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/SelfTest.java
+	$(JAR) cfe $(OUT_DIR)/GiantMushroomFinder-1.0.0.jar dev.sakuhime.mushroomfinder.Main \
+		-C $(JAVA_OUT) . \
+		-C src/main/resources .
 
 selftest: jar
-	java -cp $(OUT_DIR)/classes -Djava.library.path=$(OUT_DIR) dev.sakuhime.mushroomfinder.Main --self-test
+	java -cp $(OUT_DIR)/GiantMushroomFinder-1.0.0.jar dev.sakuhime.mushroomfinder.Main --self-test
 
 dist: cli jar
 	@echo Build complete

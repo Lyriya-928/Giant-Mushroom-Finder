@@ -15,7 +15,7 @@ public final class NativeBridge {
             NativeLoader.load();
             loaded = true;
         } catch (Throwable t) {
-            loadError = String.valueOf(t.getMessage());
+            loadError = t.getMessage() != null ? t.getMessage() : String.valueOf(t);
             loaded = false;
         }
     }
