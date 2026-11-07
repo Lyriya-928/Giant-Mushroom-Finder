@@ -1,5 +1,5 @@
 /*
- * Giant Mushroom Island Finder — native search core
+ * Large Biome Finder — native search core
  *
  * Search architecture inspired by:
  *   SunnySlopes/RiverFinderGUI
@@ -15,7 +15,7 @@
 #define MUSHROOM_FINDER_H_
 
 /** Application version (keep in sync with /VERSION and Java AppInfo). */
-#define GMIF_VERSION "1.0.0"
+#define GMIF_VERSION "1.1.0"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -33,20 +33,57 @@ enum {
     GMIF_SCALE_QUAD  = 64
 };
 
+/**
+ * Automatic tile threshold, in coarse sample cells.
+ *
+ * Measured on Windows (i5-13490F, 16 logical / 10 physical cores), seed 262,
+ * scale 16, no refine:
+ *   - monolithic r=5000 (0.39 M cells): 2.7 s at 1 thread, 0.35 s at 16;
+ *     peak working set 6 MB (was 29 MB before the CCA rewrite);
+ *   - monolithic r=15000 (3.5 M cells): 30.7 s at 1 thread, 3.4 s at 16;
+ *     peak working set 9 MB;
+ *   - tiled r=30000 (14 M cells, tile 256): 16–22 s at 10 threads, peak 6 MB.
+ *
+ * Monolithic memory is ≈ 4 B per coarse cell plus one fill band per worker,
+ * so 12 M cells predicts ≈ 50–60 MB peak, while tiled stays at 6–30 MB for
+ * any radius. 12 M cells is therefore the point where the full-grid path
+ * stops being the safer choice; at scale 16 that is a radius of ≈ 27,700
+ * blocks, at scale 4 ≈ 6,900 blocks.
+ */
+#define GMIF_MONO_MAX_CELLS 12000000LL
+
+/**
+ * Hard stop for tiled work. The row-streaming merge keeps border memory
+ * independent of the tile count, so the practical ceiling is time rather than
+ * RAM. 10e9 coarse cells is 5x the previous limit; at scale 16 it is a radius
+ * of 799,984 blocks (the GUI shows this value). The plan resolves the actual
+ * tile size and rejects unsupported radii before any allocation.
+ */
+#define GMIF_TILED_MAX_CELLS 10000000000LL
+#define GMIF_TILED_MAX_TILES 2000000LL
 typedef struct SearchParams {
     int64_t seed;          /* Minecraft Java seed */
     int     mc;            /* cubiomes MCVersion enum value */
-    int     radius;        /* search half-size in blocks around origin ([-R,R]) */
+    int     center_x;      /* search center X in blocks */
+    int     center_z;      /* search center Z in blocks */
+    int     radius;        /* search half-size in blocks around center */
     int64_t min_area;      /* min estimated area in blocks^2; 0 = no filter */
     int     scale;         /* coarse sample scale (16 recommended) */
     int     refine;        /* 0 = coarse only, 1 = refine candidates */
-    int     include_shore; /* if nonzero, treat shore as part of island */
-    int     threads;       /* sampling threads (OpenMP) */
+    int     include_shore; /* legacy: also count mushroom_field_shore */
+    int     threads;       /* worker threads; 0 = auto (physical cores) */
     int     max_results;   /* keep top-N by area after sort; 0 = all */
     /* 0 = monolithic (legacy full-grid), 1 = tiled streaming, 2 = auto */
     int     use_tiles;
     /* Tile side in sample cells; 0 = auto. Used when use_tiles != 0. */
     int     tile_size;
+    /**
+     * Optional target biome set (cubiomes biome ids, 0..255). When NULL or
+     * empty the historical behaviour is used: mushroom_fields, plus
+     * mushroom_field_shore when include_shore is set.
+     */
+    const int *biome_ids;
+    int     biome_count;
 } SearchParams;
 
 typedef struct MushroomIsland {
@@ -57,15 +94,16 @@ typedef struct MushroomIsland {
     int64_t area;          /* estimated area in blocks^2 (sample-based) */
     int64_t samples;       /* number of positive samples */
     int     area_precision;/* 0=coarse estimate, 1=refined scale4, 2=scale1 */
-    double  distance;      /* Euclidean distance from (0,0) */
+    double  distance;      /* Euclidean distance from the search center */
     double  compactness;   /* 4*pi*A / P^2 estimate */
     int     perimeter;     /* estimated perimeter in blocks */
 } MushroomIsland;
 
 typedef struct SearchProgress {
     int     percent;       /* 0..100 */
-    const char *stage;     /* "scan", "connect", "refine", "done" */
+    const char *stage;     /* "scan", "tile", "connect", "refine", "done" */
     int64_t found;         /* islands found so far */
+    int     mode;          /* 0=monolithic, 1=tiled */
 } SearchProgress;
 
 typedef void (*ProgressFn)(const SearchProgress *p, void *userdata);
@@ -81,8 +119,9 @@ typedef struct GmifControl {
     volatile int stop;    /* nonzero = stop requested */
     /* Progress snapshot (written by search thread, read by UI). */
     volatile int percent;
-    volatile int stage;   /* 0 scan, 1 connect, 2 refine, 3 done */
+    volatile int stage;   /* 0 scan, 1 connect, 2 refine, 3 done, 4 tile, 5 merge */
     volatile int64_t found;
+    volatile int mode;    /* 0=monolithic, 1=tiled */
 } GmifControl;
 
 void gmif_control_init(GmifControl *c);
@@ -97,9 +136,10 @@ int  gmif_control_wait_if_paused(GmifControl *c);
  *
  * On success returns 0 and stores results in *out (malloc'd array of
  * *out_count islands, sorted by area descending). Caller must free(*out).
- * Returns -1 on allocation/setup failure, -2 if cancelled/stopped.
+ * Returns negative GMIF_ERR_* on failure (-2 if cancelled/stopped).
  *
- * `control` may be NULL. `cancel` may be NULL.
+ * `control` may be NULL. `cancel` may be NULL. `params->threads == 0`
+ * selects the physical-core default.
  */
 int gmif_search(const SearchParams *params,
                 MushroomIsland **out, int *out_count,
@@ -138,14 +178,49 @@ int gmif_last_error_code(void);
 int gmif_set_error(int code, const char *fmt, ...);
 
 /**
- * Compute coarse grid geometry without running a search.
- * Returns 0 on success. On failure sets last error and returns a GMIF_ERR_*.
- * Outputs: half (samples per side), sx/sz (grid size), cells, mask_bytes, biome_bytes.
+ * Recommended worker count: physical cores on Windows, available CPUs
+ * elsewhere. Never returns less than 1.
  */
-int gmif_describe_grid(int radius, int scale,
-                       int *out_half, int *out_sx, int *out_sz,
-                       int64_t *out_cells,
-                       int64_t *out_mask_bytes, int64_t *out_biome_bytes);
+int gmif_default_threads(void);
+
+/**
+ * Maximum radius (blocks) accepted by the tiled planner for a sample scale.
+ * Derived from GMIF_TILED_MAX_CELLS and capped by the world border. This is
+ * the value the GUI should display as the real capability of the build.
+ */
+int gmif_max_radius(int scale);
+
+/** Search plan produced before touching Cubiomes. */
+typedef struct GmifSearchPlan {
+    int     scale;
+    int     center_x, center_z;
+    int64_t world_x0, world_z0; /* first sampled cell origin, in blocks */
+    int64_t cell_x0, cell_z0;   /* first sampled cell, in scaled units */
+    int64_t sx, sz;             /* coarse grid size in sample cells */
+    int64_t cells;              /* sx * sz */
+    int     use_tiles;          /* resolved 0/1 */
+    int     tile_size;          /* resolved tile side, in samples */
+    int     threads;            /* resolved worker count */
+    int64_t est_samples;        /* approximate biome samples required */
+    int64_t est_peak_bytes;     /* approximate peak working set */
+} GmifSearchPlan;
+
+/**
+ * Resolve the coarse grid + scan mode + thread count for a search.
+ * Returns 0 on success (plan filled), or a GMIF_ERR_* with a message.
+ * Passing NULL for `out` is a validation-only call.
+ */
+int gmif_plan_search(const SearchParams *params, GmifSearchPlan *out);
+
+/**
+ * Coarse grid geometry without running a search.
+ * Returns 0 on success. On failure sets last error and returns a GMIF_ERR_*.
+ * Origin/size are in scaled sample units; sx/sz may be large for tiled search.
+ */
+int gmif_describe_grid(int center_x, int center_z, int radius, int scale,
+                       int *out_sx, int *out_sz,
+                       int64_t *out_cell_x0, int64_t *out_cell_z0,
+                       int64_t *out_cells, int64_t *out_mask_bytes);
 
 /**
  * Sample biome at a world block position via Cubiomes (scale=1, y=63).
@@ -157,9 +232,6 @@ int gmif_sample_biome(int64_t seed, int mc, int x, int z);
  * Tiled streaming search: processes the range in tiles (constant memory)
  * and merges regions across tile borders with Union-Find.
  * Same output contract as gmif_search.
- *
- * Architecture note: tile-local CCA + global DSU merge. No Cubiomes changes.
- * Inspired by multi-stage region search patterns (architecture only).
  */
 int gmif_search_tiled(const SearchParams *params,
                       MushroomIsland **out, int *out_count,
@@ -170,26 +242,33 @@ int gmif_search_tiled(const SearchParams *params,
 int gmif_run_release_audit(void);
 
 /**
- * Fill a mushroom mask for a sample-grid window.
+ * Fill a target mask for a sample-grid window.
  *
- * When scale > 4, samples at biome scale 4 (stable) and decimates so that
- * monolithic and tiled layouts see identical cell values. Cubiomes' scale>4
- * fast path is layout-dependent and cannot be used for exact equivalence.
+ * The mask is filled in parallel over row bands.  For MC >= 1.18 and
+ * scale > 4 the centre sample of each coarse cell is evaluated directly
+ * (exactly the same value the stable scale-4 decimation produced), which
+ * avoids generating the other 15 sub-samples.  For older versions the
+ * scale-4 window is generated and decimated, still in parallel.
  *
  * Window: sample cells [ox, ox+sx) x [oz, oz+sz) in scaled units of `scale`.
- * mask must hold sx*sz bytes. Returns 0 or GMIF_ERR_*.
+ * mask must hold sx*sz bytes.  `ctl` may be NULL; when given, pause/stop and
+ * progress in [pct_from, pct_to] are honoured.
  */
-int gmif_fill_mask_range(const void *generator, int scale,
-                         int ox, int oz, int sx, int sz,
-                         int include_shore, unsigned char *mask);
+int gmif_fill_mask_range(const void *generator, const SearchParams *params,
+                         int scale, int64_t ox, int64_t oz,
+                         int sx, int sz, unsigned char *mask,
+                         GmifControl *ctl, int pct_from, int pct_to);
 
 /**
  * Refine one island's area/bounds/perimeter at finer scale (4 or 1)
  * using a padded bounding box. Updates `isl` in place.
  * Returns 1 if refined, 0 if skipped (bbox too large), <0 on error.
  */
-int gmif_refine_island(const void *generator, int coarse_scale, int fine_scale,
-                       int include_shore, MushroomIsland *isl);
+int gmif_refine_island(const void *generator, const SearchParams *params,
+                       int coarse_scale, int fine_scale, MushroomIsland *isl);
+
+/** Nonzero if biome id is part of the search target set. */
+int gmif_is_target(int biome_id, const SearchParams *params);
 
 /** Nonzero if biome id is mushroom_fields (or shore if include_shore). */
 int gmif_is_mushroom(int biome_id, int include_shore);

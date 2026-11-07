@@ -1,0 +1,68 @@
+name: Windows build & tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Build, audit, self-test
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install MinGW-w64 and make
+        shell: powershell
+        run: |
+          choco install mingw -y --no-progress
+          $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                      [Environment]::GetEnvironmentVariable('Path','User') + ';' +
+                      $env:Path
+          if (-not (Get-Command mingw32-make -ErrorAction SilentlyContinue) -and
+              -not (Get-Command make -ErrorAction SilentlyContinue)) {
+            choco install make -y --no-progress
+            $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                        [Environment]::GetEnvironmentVariable('Path','User') + ';' +
+                        $env:Path
+          }
+          gcc --version
+          $make = Get-Command mingw32-make -ErrorAction SilentlyContinue
+          if (-not $make) { $make = Get-Command make -ErrorAction SilentlyContinue }
+          if (-not $make) { throw "No make executable found" }
+          & $make.Source --version
+
+      - name: Build, native audit and Java self-test
+        shell: powershell
+        run: .\tools\ci-windows.ps1
+
+      - name: Upload Windows artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LargeBiomeFinder-windows
+          path: |
+            build/LargeBiomeFinder-*.jar
+            build/gmif_cli.exe
+            build/gmif.dll
+            build/ci-*.log
+          if-no-files-found: warn
+          retention-days: 14

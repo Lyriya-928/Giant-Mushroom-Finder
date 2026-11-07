@@ -45,6 +45,21 @@ public final class SearchRunner {
     private javax.swing.Timer progressTimer;
     private int lastPercent = 0;
     private String lastStage = STAGE_INIT;
+    private volatile boolean tiled = false;
+    private volatile long startedAtNanos = 0L;
+    private volatile long finishedAtNanos = 0L;
+
+    public boolean isTiled() {
+        return tiled;
+    }
+
+    /** Wall time of the last finished search in milliseconds (0 if none). */
+    public long lastDurationMs() {
+        long a = startedAtNanos;
+        long b = finishedAtNanos;
+        if (a == 0 || b < a) return 0L;
+        return (b - a) / 1_000_000L;
+    }
 
     public void addListener(Listener l) {
         listeners.add(l);
@@ -73,6 +88,9 @@ public final class SearchRunner {
         state.set(State.RUNNING);
         lastPercent = 0;
         lastStage = STAGE_INIT;
+        tiled = false;
+        startedAtNanos = System.nanoTime();
+        finishedAtNanos = 0L;
 
         /* Immediate feedback on the EDT before any heavy work. */
         fireProgress(-1, 0, STAGE_INIT);
@@ -121,12 +139,13 @@ public final class SearchRunner {
             fireProgress(-1, -1, STAGE_STOPPING);
             return;
         }
-        int[] out = new int[3];
+        int[] out = new int[4];
         try {
             NativeBridge.nativePollProgress(ptr, out);
         } catch (Throwable ignored) {
             return;
         }
+        tiled = out[3] == 1;
         String stage = switch (out[2]) {
             case 1 -> STAGE_CONNECT;
             case 2 -> STAGE_REFINE;
@@ -172,9 +191,9 @@ public final class SearchRunner {
             double[] flat;
             try {
                 flat = NativeBridge.nativeSearch(
-                        s.seed, s.version, s.radius, s.minArea,
+                        s.seed, s.version, s.centerX, s.centerZ, s.radius, s.minArea,
                         s.scale, s.refine, s.includeShore, controlPtr,
-                        s.threads, s.maxResults);
+                        s.threads, s.maxResults, s.biomes);
             } catch (UnsatisfiedLinkError e) {
                 finishError("Native library is out of date (missing " + e.getMessage()
                         + "). Rebuild with .\\build.ps1 and restart the app.");
@@ -198,6 +217,7 @@ public final class SearchRunner {
             }
             state.set(State.DONE);
             stopTimer();
+            finishedAtNanos = System.nanoTime();
             fireProgress(100, results.size(), STAGE_DONE);
             fireCompleted(results);
         } catch (Throwable t) {
@@ -210,27 +230,41 @@ public final class SearchRunner {
                 finishError(String.valueOf(t.getMessage()));
             }
         } finally {
-            destroyControl();
+            /* Free the control block on the EDT after any already-queued
+             * progress poll events have run. Capture the pointer so a new
+             * search started in the meantime cannot be freed by mistake. */
+            stopTimer();
+            scheduleDestroyControl();
         }
+    }
+
+    private void scheduleDestroyControl() {
+        final long ptr;
+        synchronized (this) {
+            ptr = controlPtr;
+        }
+        if (ptr == 0) return;
+        SwingUtilities.invokeLater(() -> {
+            synchronized (SearchRunner.this) {
+                if (controlPtr != ptr) return;
+                NativeBridge.nativeDestroyControl(ptr);
+                controlPtr = 0;
+            }
+        });
     }
 
     private void finishCancel() {
         state.set(State.CANCELLED);
         stopTimer();
+        finishedAtNanos = System.nanoTime();
         fireCancelled();
     }
 
     private void finishError(String msg) {
         state.set(State.ERROR);
         stopTimer();
+        finishedAtNanos = System.nanoTime();
         fireError(msg);
-    }
-
-    private synchronized void destroyControl() {
-        if (controlPtr != 0) {
-            NativeBridge.nativeDestroyControl(controlPtr);
-            controlPtr = 0;
-        }
     }
 
     private synchronized void stopTimer() {

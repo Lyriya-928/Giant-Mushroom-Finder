@@ -11,8 +11,9 @@ LDFLAGS = -lm -fopenmp
 AR      = ar
 ARFLAGS = cr
 
-# Set this if javac is not on PATH in make's shell
-JAVA_HOME = C:/Program Files/Java/jdk-26.0.1
+# JAVA_HOME is taken from the environment (or `make JAVA_HOME=...`); build.ps1
+# passes the detected JDK explicitly. It is only needed for the JNI target.
+JAVA_HOME ?=
 JAVAC   = javac
 JAR     = jar
 
@@ -36,7 +37,7 @@ CUBIOMES_SRCS = \
 CUBIOMES_OBJS = $(patsubst $(CUBIOMES_DIR)/%.c,$(OUT_DIR)/cubiomes_%.o,$(CUBIOMES_SRCS))
 
 INCLUDES = -I$(CUBIOMES_DIR) -I$(NATIVE_DIR)
-JNI_INC  = -I"$(JAVA_HOME)/include" -I"$(JAVA_HOME)/include/win32"
+JNI_INC  = $(if $(strip $(JAVA_HOME)),-I"$(JAVA_HOME)/include" -I"$(JAVA_HOME)/include/win32",$(error JAVA_HOME is not set; run build.ps1 or pass JAVA_HOME=...))
 
 .PHONY: all cli native jar selftest dist clean
 
@@ -45,7 +46,7 @@ all: cli
 cli: $(OUT_DIR)/gmif_cli.exe
 
 $(OUT_DIR)/gmif_cli.exe: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a
-	$(CC) -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS)
+	$(CC) -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS) -lpsapi
 
 $(OUT_DIR)/libcubiomes.a: $(CUBIOMES_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -74,8 +75,7 @@ $(OUT_DIR)/mushroom_finder_JNI.o: $(NATIVE_DIR)/mushroom_finder_JNI.c $(NATIVE_D
 	$(CC) $(CFLAGS) $(INCLUDES) $(JNI_INC) -c $< -o $@
 
 native: $(OUT_DIR)/gmif.dll
-	@if not exist src\main\resources\native\windows-x86_64 mkdir src\main\resources\native\windows-x86_64
-	copy /Y $(OUT_DIR)\gmif.dll src\main\resources\native\windows-x86_64\gmif.dll
+	powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path 'src/main/resources/native/windows-x86_64' | Out-Null; Copy-Item '$(OUT_DIR)/gmif.dll' 'src/main/resources/native/windows-x86_64/gmif.dll' -Force"
 
 $(OUT_DIR):
 	mkdir $(OUT_DIR)
@@ -86,6 +86,8 @@ $(JAVA_OUT): | $(OUT_DIR)
 jar: native $(JAVA_OUT)
 	$(JAVAC) -encoding UTF-8 -d $(JAVA_OUT) \
 		$(JAVA_SRC)/$(JAVA_PKG)/AppInfo.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/BiomePreset.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/FluentTheme.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/Main.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/MainFrame.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/I18n.java \
@@ -95,13 +97,14 @@ jar: native $(JAVA_OUT)
 		$(JAVA_SRC)/$(JAVA_PKG)/SearchRunner.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/SearchSettings.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/SearchResult.java \
+		$(JAVA_SRC)/$(JAVA_PKG)/UserPrefs.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/SelfTest.java
-	$(JAR) cfe $(OUT_DIR)/GiantMushroomFinder-1.0.0.jar dev.sakuhime.mushroomfinder.Main \
+	$(JAR) cfe $(OUT_DIR)/LargeBiomeFinder-1.1.0.jar dev.sakuhime.mushroomfinder.Main \
 		-C $(JAVA_OUT) . \
 		-C src/main/resources .
 
 selftest: jar
-	java -cp $(OUT_DIR)/GiantMushroomFinder-1.0.0.jar dev.sakuhime.mushroomfinder.Main --self-test
+	java --enable-native-access=ALL-UNNAMED -cp $(OUT_DIR)/LargeBiomeFinder-1.1.0.jar dev.sakuhime.mushroomfinder.Main --self-test
 
 dist: cli jar
 	@echo Build complete

@@ -17,6 +17,7 @@ public final class Main {
                 UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
             } catch (Exception ignored) {
             }
+            FluentTheme.applyGlobalDefaults();
             MainFrame frame = new MainFrame();
             frame.setVisible(true);
         });
