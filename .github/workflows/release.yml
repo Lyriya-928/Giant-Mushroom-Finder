@@ -65,11 +65,23 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           if ($tag -notmatch '^v\d') { throw "Refusing to publish from non-version ref: $tag" }
+          $title = "Large Biome Finder $tag"
+          $notes = "build\release\release-notes.md"
           $assets = Get-Content "build\release\assets.txt"
-          gh release create $tag @assets `
-            --title "Large Biome Finder $tag" `
-            --notes-file "build\release\release-notes.md" `
-            --verify-tag
+
+          # Re-running a release (or re-tagging a fixed build) must update the
+          # existing release instead of failing on "already exists".
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; updating assets and notes."
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            gh release edit $tag --title $title --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+          } else {
+            gh release create $tag @assets --title $title --notes-file $notes --verify-tag
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
 
       - name: Job summary
         if: always()
