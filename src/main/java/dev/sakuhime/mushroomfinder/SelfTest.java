@@ -7,11 +7,21 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Headless verification used by --self-test. Runs one search against a
- * known seed and checks that a mushroom island near origin is found.
+ * Headless verification used by --self-test. Exercises the JNI boundary,
+ * radius validation, plan/mode selection and a few real searches (including
+ * a custom centre and a custom biome target).
  */
 final class SelfTest {
     private SelfTest() {}
+
+    private static int failures = 0;
+
+    private static final class Outcome {
+        List<SearchResult> results;
+        String error;
+        int maxPercent;
+        int ticks;
+    }
 
     static int run() {
         if (!NativeBridge.isLoaded()) {
@@ -19,13 +29,14 @@ final class SelfTest {
                     + NativeBridge.getLoadError());
             return 2;
         }
-        System.out.println("Native library loaded.");
+        System.out.println("Native library loaded (v" + AppInfo.VERSION + ").");
+        System.out.println("Physical-core default threads: " + NativeBridge.defaultThreads());
         System.out.println("Versions: " + String.join(", ", NativeBridge.nativeKnownVersions()));
 
         System.out.println("== Radius validation ==");
         expect(RadiusValidator.parse("63").error == RadiusValidator.Error.TOO_SMALL, "63 rejected");
         expect(RadiusValidator.parse("64").ok(), "64 accepted");
-        expect(RadiusValidator.parse("200000").ok(), "200000 accepted (no project cap)");
+        expect(RadiusValidator.parse("200000").ok(), "200000 accepted");
         expect(RadiusValidator.parse("1000000").ok(), "1_000_000 accepted");
         expect(RadiusValidator.parse("30000000").ok(), "30_000_000 accepted (world border)");
         expect(RadiusValidator.parse("30000001").error == RadiusValidator.Error.BEYOND_WORLD_BORDER,
@@ -34,36 +45,124 @@ final class SelfTest {
         expect(RadiusValidator.parse("12.5").error == RadiusValidator.Error.NOT_INTEGER, "12.5 rejected");
         expect(RadiusValidator.parse("100000").isLarge(), "100000 large warning");
         expect(RadiusValidator.parse("1000000").isHuge(), "1000000 huge warning");
-        expect(RadiusValidator.parse("1000").ok() && !RadiusValidator.parse("1000").isLarge(), "1000 normal");
-        long samples = RadiusValidator.parse("1000").coarseSamplePoints(16);
-        expect(samples == 126L * 126L, "coarse samples r=1000 scale16 = 126²");
+        expect(RadiusValidator.parse("1000").coarseSamplePoints(16) == 126L * 126L,
+                "coarse samples r=1000 scale16 = 126²");
 
-        System.out.println("== Grid / large-radius error reasons ==");
-        long[] g5k = NativeBridge.nativeDescribeGrid(5000, 16);
-        expect(g5k != null && g5k[3] > 0, "describe 5000 ok");
-        long[] g100k = NativeBridge.nativeDescribeGrid(100000, 16);
-        expect(g100k != null && g100k[3] > 0, "describe 100000 ok");
-        long[] g10m = NativeBridge.nativeDescribeGrid(10_000_000, 16);
-        expect(g10m == null, "describe 10M fails (grid too large)");
+        System.out.println("== Search plans / error reasons ==");
+        NativeBridge.SearchPlan small = NativeBridge.plan("1.18", 0, 0, 5000, 16, 2, 0, 0);
+        expect(small != null, "plan r=5000 ok");
+        if (small != null) {
+            expect(!small.tiled(), "r=5000 auto -> monolithic");
+            expect(small.cells() == 626L * 626L, "r=5000 grid = 626²");
+            System.out.printf("    mono plan: %s, ~%.1f MB, ~%,d samples%n",
+                    small.gridText(), small.estMb(), small.estSamples());
+        }
+        NativeBridge.SearchPlan big = NativeBridge.plan("1.18", 0, 0, 40000, 16, 2, 0, 0);
+        expect(big != null && big.tiled(), "r=40000 auto -> tiled");
+        if (big != null) {
+            System.out.printf("    tiled plan: %s, tile=%d, ~%.1f MB%n",
+                    big.gridText(), big.tileSize(), big.estMb());
+        }
+        expect(NativeBridge.plan("1.18", 0, 0, 30_000_000, 16, 2, 0, 0) == null,
+                "r=30M rejected by plan");
         expect(NativeBridge.nativeGetLastErrorCode() == NativeBridge.ERR_GRID_TOO_LARGE,
-                "10M code is GRID_TOO_LARGE");
-        String e10 = NativeBridge.nativeGetLastError();
-        expect(e10 != null && !e10.contains("version string"),
-                "10M message does not say version string");
-        System.out.println("    10M: " + e10);
+                "r=30M code is GRID_TOO_LARGE");
+        expect(NativeBridge.plan("1.18", 0, 0, 10_000_000, 16, 0, 0, 0) == null,
+                "forced monolithic r=10M rejected");
+        long[] g = NativeBridge.nativeDescribeGrid(0, 0, 5000, 16);
+        expect(g != null && g[2] > 0, "describeGrid r=5000 ok");
 
+        System.out.println("== Native limit / biome presets ==");
+        int max16 = NativeBridge.maxRadius(16);
+        expect(max16 > 700000 && max16 < 1000000,
+                "native max radius at scale16 is " + max16);
+        NativeBridge.SearchPlan maxPlan = NativeBridge.plan("1.18", 0, 0, max16, 16, 2, 0, 0);
+        expect(maxPlan != null && maxPlan.tiled(),
+                "native max radius plans a tiled scan");
+        expect(NativeBridge.plan("1.18", 0, 0, max16 + 1, 16, 2, 0, 0) == null,
+                "native max radius + 1 is rejected");
+        expect(BiomePreset.byId("plains").ids()[0] == 1, "plains preset id=1");
+        expect(BiomePreset.byId("ocean").ids()[0] == 0, "ocean preset id=0");
+        expect(BiomePreset.byId("cherry_grove").ids()[0] == 185,
+                "cherry grove preset id=185");
+        expect(BiomePreset.byId(BiomePreset.CUSTOM_ID).isCustom(),
+                "custom preset has no fixed ids");
+
+        System.out.println("== Real search: seed 262 / 1.18 / r=500 refine ==");
+        Outcome o1 = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 500, 0L, 16, true, false, 0, 10, 2, 0, null));
+        if (o1.error != null) {
+            expect(false, "search error: " + o1.error);
+        } else {
+            expect(o1.results != null && !o1.results.isEmpty(), "results found");
+            if (o1.results != null) {
+                SearchResult top = o1.results.get(0);
+                expect(Math.abs(top.centerX) < 200 && Math.abs(top.centerZ) < 200,
+                        "largest island near origin");
+                expect(top.area > 10000, "largest island area > 10k");
+                expect(top.areaPrecision == 1, "refined precision reported");
+                System.out.printf("    top center=(%d,%d) area=%d span=%dx%d dist=%.0f%n",
+                        top.centerX, top.centerZ, top.area, top.width, top.height,
+                        top.distance);
+            }
+            expect(o1.maxPercent >= 50, "progress advanced (max=" + o1.maxPercent + "%)");
+        }
+
+        System.out.println("== Real search: custom centre (-1000,-1000) ==");
+        Outcome o2 = runSearch(new SearchSettings(
+                262L, "1.18", -1000, -1000, 1200, 0L, 16, false, false, 0, 10, 2, 0, null));
+        if (o2.error != null) {
+            expect(false, "search error: " + o2.error);
+        } else {
+            expect(o2.results != null && !o2.results.isEmpty(), "custom-centre results");
+            if (o2.results != null && !o2.results.isEmpty()) {
+                SearchResult r = o2.results.get(0);
+                boolean inBox = Math.abs(r.centerX + 1000) <= 1200 + 80
+                        && Math.abs(r.centerZ + 1000) <= 1200 + 80;
+                expect(inBox, "result stays inside the custom box");
+                double expected = Math.hypot(r.centerX + 1000.0, r.centerZ + 1000.0);
+                expect(Math.abs(r.distance - expected) < 40,
+                        "distance is measured from the custom centre");
+            }
+        }
+
+        System.out.println("== Real search: custom biome target (cold ocean 46) ==");
+        Outcome o3 = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 600, 0L, 16, false, false, 0, 5, 2, 0,
+                new int[] {46}));
+        if (o3.error != null) {
+            expect(false, "search error: " + o3.error);
+        } else {
+            expect(o3.results != null && !o3.results.isEmpty(), "custom biome results");
+            if (o3.results != null && !o3.results.isEmpty()) {
+                SearchResult r = o3.results.get(0);
+                int id = NativeBridge.nativeSampleBiome(262L, "1.18", r.centerX, r.centerZ);
+                expect(id == 46, "largest cold-ocean region centre has biome 46 (got " + id + ")");
+                System.out.printf("    top target region center=(%d,%d) area=%d%n",
+                        r.centerX, r.centerZ, r.area);
+            }
+        }
+
+        System.out.println("========================================");
+        if (failures == 0) {
+            System.out.println("SELF-TEST PASS");
+            return 0;
+        }
+        System.out.println("SELF-TEST FAIL (" + failures + " failure(s))");
+        return 1;
+    }
+
+    private static Outcome runSearch(SearchSettings settings) {
+        Outcome out = new Outcome();
         SearchRunner runner = new SearchRunner();
         CountDownLatch done = new CountDownLatch(1);
         AtomicReference<List<SearchResult>> resultsRef = new AtomicReference<>();
         AtomicReference<String> errRef = new AtomicReference<>();
-        final int[] maxPct = {0};
-        final int[] progressTicks = {0};
 
         runner.addListener(new SearchRunner.Listener() {
             @Override public void onProgress(int percent, int found, String stage) {
-                progressTicks[0]++;
-                if (percent > maxPct[0]) maxPct[0] = percent;
-                System.out.printf("progress %d%% found=%d stage=%s%n", percent, found, stage);
+                out.ticks++;
+                if (percent > out.maxPercent) out.maxPercent = percent;
             }
             @Override public void onCompleted(List<SearchResult> results) {
                 resultsRef.set(results);
@@ -79,54 +178,25 @@ final class SelfTest {
             }
         });
 
-        SearchSettings settings = new SearchSettings(
-                262L, "1.18", 500, 0L, 16, true, false, 1, 10);
         runner.start(settings);
-
         try {
-            if (!done.await(60, TimeUnit.SECONDS)) {
-                System.err.println("FAIL: timeout");
+            if (!done.await(180, TimeUnit.SECONDS)) {
                 runner.stop();
-                return 3;
+                out.error = "timeout";
+                return out;
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return 4;
+            out.error = "interrupted";
+            return out;
         }
-
-        List<SearchResult> results = resultsRef.get();
-        if (errRef.get() != null) {
-            System.err.println("FAIL: " + errRef.get());
-            return 5;
-        }
-        if (results == null || results.isEmpty()) {
-            System.err.println("FAIL: no islands found for seed 262");
-            return 6;
-        }
-
-        boolean nearOrigin = false;
-        for (SearchResult r : results) {
-            System.out.printf(
-                    "  island center=(%d,%d) area=%d [%s] span=%dx%d diag=%.0f dist=%.0f%n",
-                    r.centerX, r.centerZ, r.area, r.areaLabel(),
-                    r.width, r.height, r.diagonalSpan, r.distance);
-            if (Math.abs(r.centerX) < 200 && Math.abs(r.centerZ) < 200 && r.area > 10000) {
-                nearOrigin = true;
-            }
-        }
-        if (!nearOrigin) {
-            System.err.println("FAIL: expected a large island near origin for seed 262");
-            return 7;
-        }
-        if (maxPct[0] < 50) {
-            System.err.println("FAIL: progress never advanced (max=" + maxPct[0] + "%)");
-            return 8;
-        }
-        System.out.println("PASS (max progress " + maxPct[0] + "%, ticks=" + progressTicks[0] + ")");
-        return 0;
+        out.error = errRef.get();
+        out.results = resultsRef.get() == null ? List.of() : resultsRef.get();
+        return out;
     }
 
     private static void expect(boolean cond, String name) {
         System.out.println((cond ? "  [PASS] " : "  [FAIL] ") + name);
+        if (!cond) failures++;
     }
 }

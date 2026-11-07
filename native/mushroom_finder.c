@@ -1,5 +1,5 @@
 /*
- * Giant Mushroom Island Finder — native search core
+ * Large Biome Finder — native search core
  *
  * Uses Cubiomes (MIT) for Minecraft Java Edition biome generation:
  *   https://github.com/Cubitect/cubiomes
@@ -31,6 +31,7 @@
 #endif
 
 #include "generator.h"
+#include "biomenoise.h"
 #include "util.h"
 
 /* ------------------------------------------------------------------ */
@@ -76,106 +77,290 @@ static int gmif_fail(int code, const char *fmt, ...)
     return code;
 }
 
-/** Format byte counts as B/KB/MB/GB/TB (not truncated mid-unit). */
-static void fmt_bytes(int64_t n, char *out, size_t cap)
+static int64_t floor_div(int64_t a, int64_t b)
 {
-    if (n < 1024) {
-        snprintf(out, cap, "%lld B", (long long)n);
-    } else if (n < 1024LL * 1024) {
-        snprintf(out, cap, "%.1f KB", n / 1024.0);
-    } else if (n < 1024LL * 1024 * 1024) {
-        snprintf(out, cap, "%.1f MB", n / (1024.0 * 1024.0));
-    } else if (n < 1024LL * 1024 * 1024 * 1024) {
-        snprintf(out, cap, "%.2f GB", n / (1024.0 * 1024.0 * 1024.0));
-    } else {
-        snprintf(out, cap, "%.2f TB", n / (1024.0 * 1024.0 * 1024.0 * 1024.0));
+    int64_t q = a / b;
+    int64_t r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) q--;
+    return q;
+}
+
+static int valid_scale(int scale)
+{
+    return scale == 1 || scale == 4 || scale == 16 || scale == 64 || scale == 256;
+}
+
+static int valid_biome_id(int id)
+{
+    return id >= 0 && id < 256;
+}
+
+int gmif_is_target(int biome_id, const SearchParams *p)
+{
+    if (!p) {
+        return biome_id == mushroom_fields || biome_id == mushroom_field_shore;
     }
+    if (p->biome_ids && p->biome_count > 0) {
+        for (int i = 0; i < p->biome_count; i++) {
+            if (p->biome_ids[i] == biome_id) return 1;
+        }
+        return 0;
+    }
+    if (biome_id == mushroom_fields) return 1;
+    if (p->include_shore && biome_id == mushroom_field_shore) return 1;
+    return 0;
 }
 
-/* Max coarse cells we will even attempt to allocate.
- * mask = 1 byte/cell; biomeIds ≈ 4 bytes/cell (plus small pad).
- * 250e6 cells → ~250 MB mask + ~1 GB biome buffer. */
-#define GMIF_MAX_COARSE_CELLS 250000000LL
-
-/** Largest radius (blocks) that fits GMIF_MAX_COARSE_CELLS at this scale. */
-static int max_radius_for_scale(int scale)
+int gmif_is_mushroom(int biome_id, int include_shore)
 {
-    /* half ≈ sqrt(max_cells)/2 ; radius ≈ half * scale */
-    double half = sqrt((double)GMIF_MAX_COARSE_CELLS) / 2.0;
-    double r = half * (double)scale * 0.98; /* margin */
-    if (r < 64.0) r = 64.0;
-    if (r > 30000000.0) r = 30000000.0;
-    return (int)r;
+    if (biome_id == mushroom_fields) return 1;
+    if (include_shore && biome_id == mushroom_field_shore) return 1;
+    return 0;
 }
 
-int gmif_describe_grid(int radius, int scale,
-                       int *out_half, int *out_sx, int *out_sz,
-                       int64_t *out_cells,
-                       int64_t *out_mask_bytes, int64_t *out_biome_bytes)
+/**
+ * Coarse grid covers the full block box [center-radius, center+radius] and is
+ * aligned to the sample scale.  Cells are aligned so that a search centred on
+ * X=0 keeps the historical grid.
+ */
+int gmif_describe_grid(int center_x, int center_z, int radius, int scale,
+                       int *out_sx, int *out_sz,
+                       int64_t *out_cell_x0, int64_t *out_cell_z0,
+                       int64_t *out_cells, int64_t *out_mask_bytes)
 {
     gmif_clear_error();
     if (radius < 1) {
         return gmif_fail(GMIF_ERR_INVALID_ARG, "radius must be >= 1 (got %d)", radius);
     }
-    if (scale != 1 && scale != 4 && scale != 16 && scale != 64 && scale != 256) {
-        return gmif_fail(GMIF_ERR_INVALID_ARG, "unsupported scale %d", scale);
+    if (!valid_scale(scale)) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG,
+            "unsupported scale %d (use 1, 4, 16, 64 or 256)", scale);
+    }
+    if (center_x < -30000000 || center_x > 30000000
+        || center_z < -30000000 || center_z > 30000000) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG,
+            "search center outside the Minecraft world border: (%d, %d)",
+            center_x, center_z);
+    }
+    int64_t x_lo = (int64_t)center_x - (int64_t)radius;
+    int64_t x_hi = (int64_t)center_x + (int64_t)radius;
+    int64_t z_lo = (int64_t)center_z - (int64_t)radius;
+    int64_t z_hi = (int64_t)center_z + (int64_t)radius;
+    if (x_lo < -30000000 || x_hi > 30000000
+        || z_lo < -30000000 || z_hi > 30000000) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG,
+            "search box [%lld,%lld]..[%lld,%lld] exceeds the Minecraft world border (+/-30000000).\n"
+            "  Reduce the radius or move the search center.",
+            (long long)x_lo, (long long)z_lo, (long long)x_hi, (long long)z_hi);
     }
 
-    /* Use 64-bit for all intermediate products. */
-    int64_t half64 = ((int64_t)radius + scale - 1) / scale;
-    int64_t sx64 = half64 * 2;
-    int64_t sz64 = sx64;
+    int64_t c0x = floor_div(x_lo, scale);
+    int64_t c1x = floor_div(x_hi, scale) + 1;
+    int64_t c0z = floor_div(z_lo, scale);
+    int64_t c1z = floor_div(z_hi, scale) + 1;
+
+    int64_t sx64 = c1x - c0x;
+    int64_t sz64 = c1z - c0z;
+    if (sx64 <= 0 || sz64 <= 0 || sx64 > INT32_MAX || sz64 > INT32_MAX) {
+        return gmif_fail(GMIF_ERR_OVERFLOW,
+            "grid size overflows 32-bit: %lld x %lld (radius=%d scale=%d)",
+            (long long)sx64, (long long)sz64, radius, scale);
+    }
+    if (c0x < INT32_MIN || c0x > INT32_MAX || c0z < INT32_MIN || c0z > INT32_MAX) {
+        return gmif_fail(GMIF_ERR_OVERFLOW,
+            "sample origin overflows 32-bit: (%lld, %lld)", (long long)c0x, (long long)c0z);
+    }
+
     int64_t cells64 = sx64 * sz64;
 
-    if (sx64 > INT32_MAX || sz64 > INT32_MAX) {
-        return gmif_fail(GMIF_ERR_OVERFLOW,
-            "grid size overflows 32-bit: half=%lld sx=%lld (radius=%d scale=%d)",
-            (long long)half64, (long long)sx64, radius, scale);
-    }
-    /* world origin = -half * scale must fit in int32. */
-    int64_t world0 = -half64 * (int64_t)scale;
-    if (world0 < INT32_MIN || -world0 > INT32_MAX) {
-        return gmif_fail(GMIF_ERR_OVERFLOW,
-            "world origin overflows int32: %lld (radius=%d scale=%d)",
-            (long long)world0, radius, scale);
-    }
-
-    int64_t mask_bytes = cells64; /* unsigned char */
-    /* biomeIds: at least cells * sizeof(int); scale=1 voronoi adds pad. */
-    int64_t biome_bytes = cells64 * 4;
-    if (scale == 1) {
-        int64_t px = ((sx64 + 3) / 4) + 2;
-        int64_t py = 3;
-        int64_t pz = ((sz64 + 3) / 4) + 2;
-        biome_bytes += px * py * pz * 4;
-    }
-
-    if (out_half) *out_half = (int)half64;
     if (out_sx) *out_sx = (int)sx64;
     if (out_sz) *out_sz = (int)sz64;
+    if (out_cell_x0) *out_cell_x0 = c0x;
+    if (out_cell_z0) *out_cell_z0 = c0z;
     if (out_cells) *out_cells = cells64;
-    if (out_mask_bytes) *out_mask_bytes = mask_bytes;
-    if (out_biome_bytes) *out_biome_bytes = biome_bytes;
+    if (out_mask_bytes) *out_mask_bytes = cells64;
+    return GMIF_OK;
+}
 
-    if (cells64 > GMIF_MAX_COARSE_CELLS) {
-        char msk[64], bio[64];
-        fmt_bytes(mask_bytes, msk, sizeof(msk));
-        fmt_bytes(biome_bytes, bio, sizeof(bio));
+int gmif_default_threads(void)
+{
+#ifdef _WIN32
+    DWORD len = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len)
+        || GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buf =
+            (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)malloc(len);
+        if (buf) {
+            int cores = 0;
+            if (GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &len)) {
+                BYTE *p = (BYTE *)buf;
+                BYTE *end = p + len;
+                while (p < end) {
+                    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e =
+                        (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)p;
+                    if (e->Relationship == RelationProcessorCore) cores++;
+                    p += e->Size;
+                }
+            }
+            free(buf);
+            if (cores > 0) return cores;
+        }
+    }
+    {
+        DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        if (n > 0) return (int)n;
+    }
+    return 1;
+#elif defined(_OPENMP)
+    return omp_get_num_procs();
+#else
+    return 1;
+#endif
+}
+
+int gmif_max_radius(int scale)
+{
+    if (!valid_scale(scale)) return 0;
+    int64_t side = (int64_t)sqrt((double)GMIF_TILED_MAX_CELLS);
+    while ((side + 1) > 0 && (side + 1) <= 3037000499LL
+           && (side + 1) * (side + 1) <= GMIF_TILED_MAX_CELLS) {
+        side++;
+    }
+    while (side > 0 && side * side > GMIF_TILED_MAX_CELLS) side--;
+    /* Worst-case grid span for a centre is 2*ceil(radius/scale)+1. */
+    int64_t half = (side - 1) / 2;
+    int64_t radius = half * (int64_t)scale;
+    if (radius > 30000000LL) radius = 30000000LL;
+    if (radius < 1) radius = 1;
+    return (int)radius;
+}
+
+static int build_plan(const SearchParams *p, GmifSearchPlan *out)
+{
+    if (!p) return gmif_fail(GMIF_ERR_INVALID_ARG, "null search parameters");
+    if (p->mc < 0) return gmif_fail(GMIF_ERR_VERSION, "invalid Minecraft version id %d", p->mc);
+
+    int scale = p->scale > 0 ? p->scale : GMIF_SCALE_CHUNK;
+    if (!valid_scale(scale)) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG,
+            "unsupported scale %d (use 1, 4, 16, 64 or 256)", scale);
+    }
+    int max_radius = gmif_max_radius(scale);
+    if (p->radius > max_radius) {
         return gmif_fail(GMIF_ERR_GRID_TOO_LARGE,
-            "search grid too large for this build (memory).\n"
-            "  requested: radius=%d scale=%d -> %lld x %lld samples\n"
-            "  samples=%lld  mask~%s  biome buffer~%s\n"
-            "  limit: %lld samples\n"
-            "  max radius at scale %d is about %d blocks.\n"
-            "  Reduce Radius, or use a coarser scale (CLI --scale).",
-            radius, scale,
-            (long long)sx64, (long long)sz64,
-            (long long)cells64, msk, bio,
-            (long long)GMIF_MAX_COARSE_CELLS,
-            scale, max_radius_for_scale(scale));
+            "radius %d blocks exceeds the native search limit at scale %d.\n"
+            "  maximum radius: %d blocks (about %lld coarse cells).\n"
+            "  The limit is derived from int64 cell counting, int32 sample\n"
+            "  coordinates and the tiled streaming buffers, not from the GUI.\n"
+            "  Reduce the radius or use a coarser sample scale.",
+            p->radius, scale, max_radius, (long long)GMIF_TILED_MAX_CELLS);
+    }
+    if (p->biome_count < 0 || p->biome_count > 256) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG, "invalid biome count %d", p->biome_count);
+    }
+    for (int i = 0; i < p->biome_count; i++) {
+        if (!valid_biome_id(p->biome_ids[i])) {
+            return gmif_fail(GMIF_ERR_INVALID_ARG,
+                "invalid biome id %d (supported range 0..255)", p->biome_ids[i]);
+        }
     }
 
+    int sx = 0, sz = 0;
+    int64_t cx0 = 0, cz0 = 0, cells = 0, mask_bytes = 0;
+    int rc = gmif_describe_grid(p->center_x, p->center_z, p->radius, scale,
+                                &sx, &sz, &cx0, &cz0, &cells, &mask_bytes);
+    if (rc != GMIF_OK) return rc;
+
+    GmifSearchPlan plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.scale = scale;
+    plan.center_x = p->center_x;
+    plan.center_z = p->center_z;
+    plan.cell_x0 = cx0;
+    plan.cell_z0 = cz0;
+    plan.world_x0 = cx0 * scale;
+    plan.world_z0 = cz0 * scale;
+    plan.sx = sx;
+    plan.sz = sz;
+    plan.cells = cells;
+    plan.threads = p->threads > 0 ? p->threads : gmif_default_threads();
+    if (plan.threads > 256) plan.threads = 256;
+    if (plan.threads < 1) plan.threads = 1;
+
+    int use_tiles = p->use_tiles;
+    if (use_tiles < 0 || use_tiles > 2) use_tiles = 2;
+    if (use_tiles == 2) {
+        use_tiles = (cells > GMIF_MONO_MAX_CELLS) ? 1 : 0;
+    }
+    plan.use_tiles = use_tiles;
+
+    int64_t factor = scale > 4 ? (scale / 4) : 1;
+    int fast_samples = (p->mc >= MC_1_18 && scale >= 4);
+    int64_t samples_per_cell = (fast_samples || scale <= 4) ? 1 : factor * factor;
+    plan.est_samples = cells * samples_per_cell;
+    int64_t per_thread_bytes = fast_samples ? (96 * 1024)
+                                            : (3 * 1024 * 1024);
+
+    if (use_tiles == 0) {
+        if (cells > GMIF_MONO_MAX_CELLS) {
+            return gmif_fail(GMIF_ERR_GRID_TOO_LARGE,
+                "monolithic scan disabled for this range: %lld coarse cells.\n"
+                "  limit for the full-grid path: %lld cells (about 60 MB peak).\n"
+                "  Use automatic or tiled scanning (remove --no-tiles), or reduce the radius.",
+                (long long)cells, (long long)GMIF_MONO_MAX_CELLS);
+        }
+        plan.tile_size = 0;
+        plan.est_peak_bytes = cells * 4
+                            + (int64_t)plan.threads * per_thread_bytes
+                            + 6 * 1024 * 1024;
+    } else {
+        if (cells > GMIF_TILED_MAX_CELLS) {
+            return gmif_fail(GMIF_ERR_GRID_TOO_LARGE,
+                "search area is too large even for tiled streaming: %lld coarse cells.\n"
+                "  limit: %lld cells. Estimated sampling work: %lld samples.\n"
+                "  Reduce the radius (or use a coarser sample scale).",
+                (long long)cells, (long long)GMIF_TILED_MAX_CELLS,
+                (long long)plan.est_samples);
+        }
+        int tile = p->tile_size;
+        if (tile <= 0) tile = (scale == 1) ? 128 : 256;
+        if (tile < 8) tile = 8;
+        if (tile > 2048) tile = 2048;
+        /* Keep the per-tile index arrays bounded for very large searches. */
+        for (;;) {
+            int64_t ntx = (plan.sx + tile - 1) / tile;
+            int64_t ntz = (plan.sz + tile - 1) / tile;
+            int64_t ntiles = ntx * ntz;
+            if (ntiles <= GMIF_TILED_MAX_TILES || tile >= 2048) break;
+            tile *= 2;
+            if (tile > 2048) tile = 2048;
+        }
+        {
+            int64_t ntx = (plan.sx + tile - 1) / tile;
+            int64_t ntz = (plan.sz + tile - 1) / tile;
+            int64_t ntiles = ntx * ntz;
+            if (ntiles > GMIF_TILED_MAX_TILES) {
+                return gmif_fail(GMIF_ERR_GRID_TOO_LARGE,
+                    "tile index would be too large: %lld tiles at tile=%d.\n"
+                    "  limit: %lld tiles. Reduce the radius or increase the tile size.",
+                    (long long)ntiles, tile, (long long)GMIF_TILED_MAX_TILES);
+            }
+            plan.est_peak_bytes = (int64_t)tile * tile * 9
+                                + (int64_t)plan.threads * per_thread_bytes
+                                + (int64_t)plan.sx * 40
+                                + 16 * 1024 * 1024;
+        }
+        plan.tile_size = tile;
+    }
+
+    if (out) *out = plan;
     return GMIF_OK;
+}
+
+int gmif_plan_search(const SearchParams *params, GmifSearchPlan *out)
+{
+    gmif_clear_error();
+    return build_plan(params, out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,6 +375,7 @@ void gmif_control_init(GmifControl *c)
     c->percent = 0;
     c->stage = 0;
     c->found = 0;
+    c->mode = 0;
 }
 
 void gmif_control_pause(GmifControl *c)
@@ -222,6 +408,7 @@ typedef struct SearchCtx {
     void *ud;
     GmifControl *control;
     int64_t found;
+    int mode;
 } SearchCtx;
 
 static int should_stop(SearchCtx *ctx)
@@ -237,23 +424,43 @@ static int should_stop(SearchCtx *ctx)
     return 0;
 }
 
+static int raw_should_stop(GmifControl *control, CancelFn cancel, void *ud)
+{
+    if (control) {
+        if (control->stop) return 1;
+        if (control->pause) {
+            if (gmif_control_wait_if_paused(control)) return 1;
+        }
+    }
+    if (cancel && cancel(ud)) return 1;
+    return 0;
+}
+
+static void set_stage_code(GmifControl *control, const char *stage)
+{
+    if (!control || !stage) return;
+    if (stage[0] == 't' && stage[1] == 'i') control->stage = 4;
+    else if (stage[0] == 'm') control->stage = 5;
+    else if (stage[0] == 's') control->stage = 0;
+    else if (stage[0] == 'c') control->stage = 1;
+    else if (stage[0] == 'r') control->stage = 2;
+    else if (stage[0] == 'd') control->stage = 3;
+}
+
 static void report(SearchCtx *ctx, int percent, const char *stage)
 {
     if (ctx && ctx->control) {
         ctx->control->percent = percent;
         ctx->control->found = ctx->found;
-        if (stage) {
-            if (stage[0] == 'c') ctx->control->stage = 1;
-            else if (stage[0] == 'r') ctx->control->stage = 2;
-            else if (stage[0] == 'd') ctx->control->stage = 3;
-            else ctx->control->stage = 0;
-        }
+        ctx->control->mode = ctx->mode;
+        set_stage_code(ctx->control, stage);
     }
     if (!ctx || !ctx->progress) return;
     SearchProgress sp;
     sp.percent = percent;
     sp.stage = stage;
     sp.found = ctx->found;
+    sp.mode = ctx->mode;
     ctx->progress(&sp, ctx->ud);
 }
 
@@ -281,16 +488,267 @@ const char * const *gmif_known_versions(void)
     return kVersions;
 }
 
-static int is_target_biome(int id, int include_shore)
+static double dist_from_center(int x, int z, int cx, int cz)
 {
-    if (id == mushroom_fields) return 1;
-    if (include_shore && id == mushroom_field_shore) return 1;
-    return 0;
+    double dx = (double)x - (double)cx;
+    double dz = (double)z - (double)cz;
+    return sqrt(dx * dx + dz * dz);
 }
 
-static double dist2d(double dx, double dz)
+/* ------------------------------------------------------------------ */
+/* parallel mask fill                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct FillJob {
+    const Generator *g;
+    const SearchParams *p;
+    int scale;
+    int64_t ox, oz;
+    int sx, sz;
+    unsigned char *mask;
+    unsigned char hit[256];
+    int threads;
+    GmifControl *control;
+    CancelFn cancel;
+    void *ud;
+    ProgressFn progress;
+    int64_t found;
+    int pct_from, pct_to;
+    volatile int stop;
+    volatile int err;
+    int band_rows;
+    int bands;
+    int done;
+} FillJob;
+
+static int fill_should_stop(FillJob *j)
 {
-    return sqrt(dx * dx + dz * dz);
+    return raw_should_stop(j->control, j->cancel, j->ud);
+}
+
+static void fill_report(FillJob *j, int done)
+{
+    if (j->pct_from < 0 || j->pct_to < j->pct_from) return;
+    int span = j->pct_to - j->pct_from;
+    int pct = j->pct_from;
+    if (j->bands > 0) pct += (int)((int64_t)span * done / j->bands);
+    if (pct > j->pct_to) pct = j->pct_to;
+    if (j->control) {
+        j->control->percent = pct;
+        j->control->found = j->found;
+        j->control->mode = 0;
+        j->control->stage = 0;
+    }
+    if (j->progress) {
+        SearchProgress sp;
+        sp.percent = pct;
+        sp.stage = "scan";
+        sp.found = j->found;
+        sp.mode = 0;
+        j->progress(&sp, j->ud);
+    }
+}
+
+/**
+ * Direct centre sampling for MC >= 1.18.
+ *
+ * The historical "stable" mask decimated a scale-4 window: coarse cell c took
+ * scale-4 cell (c * scale/4 + scale/8), i.e. the 4-block cell at the centre of
+ * the coarse cell.  That is exactly sampleBiomeNoise(centre_x4, 15, centre_z4),
+ * so generating the other 15 sub-samples was wasted work.  This path is
+ * bit-for-bit identical to the old decimation (verified by --audit).
+ */
+static int fill_band_fast(FillJob *j, int z0, int z1)
+{
+    const int factor = j->scale / 4;
+    const int mid = factor / 2;
+    const int sx = j->sx;
+    unsigned char *mask = j->mask;
+    for (int z = z0; z < z1; z++) {
+        int64_t z4 = (j->oz + z) * factor + mid;
+        if (z4 < INT32_MIN || z4 > INT32_MAX) return GMIF_ERR_OVERFLOW;
+        size_t row = (size_t)z * (size_t)sx;
+        for (int x = 0; x < sx; x++) {
+            int64_t x4 = (j->ox + x) * factor + mid;
+            if (x4 < INT32_MIN || x4 > INT32_MAX) return GMIF_ERR_OVERFLOW;
+            int id = sampleBiomeNoise(&j->g->bn, NULL, (int)x4, 15, (int)z4, NULL, 0);
+            mask[row + (size_t)x] = (id >= 0 && id < 256) ? j->hit[id] : 0;
+        }
+    }
+    return GMIF_OK;
+}
+
+/**
+ * Cached path: generate a scale-4 (or scale-1) window and decimate its centre.
+ * Used for MC <= 1.17 (layer stack) and for scale 1.
+ */
+static int fill_band_cached(FillJob *j, int z0, int z1)
+{
+    const int gen_scale = j->scale > 4 ? 4 : j->scale;
+    const int factor = j->scale > 4 ? (j->scale / 4) : 1;
+    const int mid = factor / 2;
+    int64_t oxs = j->ox * factor;
+    int64_t ozs = (j->oz + z0) * factor;
+    int64_t fxs = (int64_t)j->sx * factor;
+    int64_t fzs = (int64_t)(z1 - z0) * factor;
+    if (oxs < INT32_MIN || oxs > INT32_MAX
+        || ozs < INT32_MIN || ozs > INT32_MAX
+        || fxs > INT32_MAX || fzs > INT32_MAX) {
+        return GMIF_ERR_OVERFLOW;
+    }
+    Range r;
+    r.scale = gen_scale;
+    r.x = (int)oxs;
+    r.z = (int)ozs;
+    r.sx = (int)fxs;
+    r.sz = (int)fzs;
+    r.y = (gen_scale == 1) ? 63 : 15;
+    r.sy = 1;
+
+    int *ids = allocCache(j->g, r);
+    if (!ids) {
+        return gmif_set_error(GMIF_ERR_ALLOC,
+            "allocation failed: sampling window %dx%d at scale %d (%.1f MB)",
+            (int)fxs, (int)fzs, gen_scale, (double)fxs * fzs * 4.0 / (1024 * 1024));
+    }
+    if (genBiomes(j->g, ids, r) != 0) {
+        free(ids);
+        return gmif_set_error(GMIF_ERR_BIOME_GEN,
+            "biome sampling failed (window %dx%d scale %d)", (int)fxs, (int)fzs, gen_scale);
+    }
+    for (int z = z0; z < z1; z++) {
+        size_t row = (size_t)z * (size_t)j->sx;
+        size_t srow = (size_t)((z - z0) * factor + mid) * (size_t)fxs;
+        for (int x = 0; x < j->sx; x++) {
+            int id = ids[srow + (size_t)(x * factor + mid)];
+            j->mask[row + (size_t)x] = (id >= 0 && id < 256) ? j->hit[id] : 0;
+        }
+    }
+    free(ids);
+    return GMIF_OK;
+}
+
+static int fill_one_band(FillJob *j, int z0, int z1)
+{
+    if (j->g->mc >= MC_1_18 && j->scale >= 4) {
+        return fill_band_fast(j, z0, z1);
+    }
+    return fill_band_cached(j, z0, z1);
+}
+
+int gmif_fill_mask_range(const void *generator, const SearchParams *params,
+                         int scale, int64_t ox, int64_t oz,
+                         int sx, int sz, unsigned char *mask,
+                         GmifControl *ctl, int pct_from, int pct_to)
+{
+    const Generator *g = (const Generator *)generator;
+    if (!g || !params || !mask || sx <= 0 || sz <= 0) {
+        return gmif_set_error(GMIF_ERR_INVALID_ARG, "invalid mask fill arguments");
+    }
+    if (!valid_scale(scale)) {
+        return gmif_set_error(GMIF_ERR_INVALID_ARG, "unsupported scale %d", scale);
+    }
+
+    FillJob j;
+    memset(&j, 0, sizeof(j));
+    j.g = g;
+    j.p = params;
+    j.scale = scale;
+    j.ox = ox;
+    j.oz = oz;
+    j.sx = sx;
+    j.sz = sz;
+    j.mask = mask;
+    j.threads = params->threads > 0 ? params->threads : gmif_default_threads();
+    if (j.threads > 256) j.threads = 256;
+    j.control = ctl;
+    j.cancel = NULL;
+    j.ud = NULL;
+    j.progress = NULL;
+    j.found = 0;
+    j.pct_from = pct_from;
+    j.pct_to = pct_to;
+
+    for (int i = 0; i < 256; i++) j.hit[i] = 0;
+    if (params->biome_ids && params->biome_count > 0) {
+        for (int i = 0; i < params->biome_count; i++) {
+            int id = params->biome_ids[i];
+            if (id >= 0 && id < 256) j.hit[id] = 1;
+        }
+    } else {
+        j.hit[mushroom_fields] = 1;
+        if (params->include_shore) j.hit[mushroom_field_shore] = 1;
+    }
+
+    if (g->mc >= MC_1_18 && scale >= 4) {
+        /* Enough row bands to keep a hybrid CPU (P+E cores) balanced, but
+         * not so many that progress reporting dominates. */
+        int target_bands = j.threads * 8;
+        int br = sz / (target_bands > 0 ? target_bands : 1);
+        if (br < 1) br = 1;
+        if (br > 32) br = 32;
+        j.band_rows = br;
+    } else {
+        int factor = scale > 4 ? (scale / 4) : 1;
+        int64_t fx = (int64_t)sx * factor;
+        int64_t bytes_per_row = fx * 4;
+        int64_t target = 2LL * 1024 * 1024;
+        int br = (int)(bytes_per_row > 0 ? (target / bytes_per_row) : sz);
+        if (br < 1) br = 1;
+        if (br > 64) br = 64;
+        if (br > sz) br = sz;
+        j.band_rows = br;
+    }
+    if (j.band_rows < 1) j.band_rows = 1;
+    j.bands = (sz + j.band_rows - 1) / j.band_rows;
+
+    int threads = j.threads;
+    if (threads > j.bands) threads = j.bands;
+    if (threads < 1) threads = 1;
+
+#ifdef _OPENMP
+    if (threads > 1 && j.bands > 1) {
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (int b = 0; b < j.bands; b++) {
+            if (j.stop) continue;
+            if (fill_should_stop(&j)) { j.stop = 1; continue; }
+            int z0 = b * j.band_rows;
+            int z1 = z0 + j.band_rows;
+            if (z1 > sz) z1 = sz;
+            int rc = fill_one_band(&j, z0, z1);
+            if (rc != GMIF_OK) {
+                j.err = rc;
+                j.stop = 1;
+                continue;
+            }
+            int done;
+            #pragma omp atomic capture
+            done = ++j.done;
+            if (j.pct_from >= 0 && (done == j.bands || (done & 3) == 0)) {
+                #pragma omp critical(gmif_fill_report)
+                fill_report(&j, done);
+            }
+        }
+    } else
+#endif
+    {
+        for (int b = 0; b < j.bands; b++) {
+            if (fill_should_stop(&j)) return GMIF_ERR_CANCELLED;
+            int z0 = b * j.band_rows;
+            int z1 = z0 + j.band_rows;
+            if (z1 > sz) z1 = sz;
+            int rc = fill_one_band(&j, z0, z1);
+            if (rc != GMIF_OK) return rc;
+            j.done = b + 1;
+            if (j.pct_from >= 0 && (j.done == j.bands || (j.done & 3) == 0)) {
+                fill_report(&j, j.done);
+            }
+        }
+    }
+
+    if (j.err != GMIF_OK) return j.err;
+    if (j.stop) return GMIF_ERR_CANCELLED;
+    return GMIF_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -300,642 +758,210 @@ static double dist2d(double dx, double dz)
 typedef struct Component {
     int min_sx, max_sx, min_sz, max_sz;
     int64_t samples;
+    int64_t edges;
 } Component;
 
-static int extract_components(const unsigned char *mask,
-                              int sx, int sz,
-                              int *labels,
+typedef struct CompVec {
+    Component *a;
+    int n;
+    int cap;
+} CompVec;
+
+static int comp_push(CompVec *v, const Component *c)
+{
+    if (v->n >= v->cap) {
+        int ncap = v->cap ? v->cap * 2 : 256;
+        Component *na = (Component *)realloc(v->a, (size_t)ncap * sizeof(Component));
+        if (!na) return GMIF_ERR_ALLOC;
+        v->a = na;
+        v->cap = ncap;
+    }
+    v->a[v->n++] = *c;
+    return GMIF_OK;
+}
+
+static int push_cell(int **stack, int *cap, int *sp, int idx, uint64_t *visited)
+{
+    if (visited[(size_t)idx >> 6] & (1ULL << (idx & 63))) return GMIF_OK;
+    if (*sp >= *cap) {
+        int ncap = *cap * 2;
+        int *ns = (int *)realloc(*stack, (size_t)ncap * sizeof(int));
+        if (!ns) return GMIF_ERR_ALLOC;
+        *stack = ns;
+        *cap = ncap;
+    }
+    visited[(size_t)idx >> 6] |= 1ULL << (idx & 63);
+    (*stack)[(*sp)++] = idx;
+    return GMIF_OK;
+}
+
+/**
+ * 4-neighbour connected components with a visited bitset and a growable DFS
+ * stack.  Perimeter edges are counted in the same pass.  The old
+ * implementation kept a full int label grid and rescanned the entire grid for
+ * every component to count its perimeter (O(cells * components)); this pass is
+ * O(cells) and uses less memory.
+ */
+static int extract_components(unsigned char *mask, int sx, int sz,
                               Component **out_comps, int *out_n,
                               SearchCtx *ctx)
 {
-    int n = 0;
     size_t cells = (size_t)sx * (size_t)sz;
-    size_t comp_cap = cells / 2 + 8;
-    Component *comps = (Component *)malloc(sizeof(Component) * comp_cap);
-    if (!comps) return -1;
+    size_t words = (cells + 63) / 64;
+    uint64_t *visited = (uint64_t *)calloc(words ? words : 1, sizeof(uint64_t));
+    if (!visited) return gmif_fail(GMIF_ERR_ALLOC, "allocation failed: visited bitset");
 
-    memset(labels, 0, cells * sizeof(int));
-
-    int *stack = (int *)malloc(sizeof(int) * cells);
+    int stack_cap = 4096;
+    int *stack = (int *)malloc((size_t)stack_cap * sizeof(int));
     if (!stack) {
-        free(comps);
-        return -1;
+        free(visited);
+        return gmif_fail(GMIF_ERR_ALLOC, "allocation failed: component stack");
     }
 
-    for (int i = 0; i < (int)cells; i++) {
-        if ((i & 0x3FF) == 0) {
-            if (should_stop(ctx)) {
-                free(stack);
-                free(comps);
-                return GMIF_ERR_CANCELLED;
-            }
-            /* connect stage: 70–78 */
-            if (cells > 0) {
-                int pct = 70 + (int)((int64_t)i * 8 / (int64_t)cells);
-                if (pct > 78) pct = 78;
-                report(ctx, pct, "connect");
-            }
-        }
-        if (!mask[i] || labels[i]) continue;
+    CompVec comps;
+    memset(&comps, 0, sizeof(comps));
 
-        if ((size_t)n >= comp_cap) {
-            free(stack);
-            free(comps);
-            return -1;
+    int rc = GMIF_OK;
+    for (int i = 0; i < (int)cells; i++) {
+        if ((i & 0xFFF) == 0) {
+            if (should_stop(ctx)) { rc = GMIF_ERR_CANCELLED; goto done; }
+            int pct = 60 + (int)((int64_t)i * 10 / (int64_t)cells);
+            if (pct > 70) pct = 70;
+            report(ctx, pct, "connect");
         }
-        n++;
+        if (!mask[i]) continue;
+        if (visited[(size_t)i >> 6] & (1ULL << (i & 63))) continue;
+
         Component c;
         c.min_sx = c.max_sx = i % sx;
         c.min_sz = c.max_sz = i / sx;
         c.samples = 0;
+        c.edges = 0;
 
         int sp = 0;
-        stack[sp++] = i;
-        labels[i] = n;
+        rc = push_cell(&stack, &stack_cap, &sp, i, visited);
+        if (rc != GMIF_OK) goto done;
 
         while (sp) {
             int idx = stack[--sp];
             int x = idx % sx;
             int z = idx / sx;
             c.samples++;
+
+            if (x == 0 || !mask[idx - 1]) c.edges++;
+            else {
+                rc = push_cell(&stack, &stack_cap, &sp, idx - 1, visited);
+                if (rc != GMIF_OK) goto done;
+            }
+            if (x == sx - 1 || !mask[idx + 1]) c.edges++;
+            else {
+                rc = push_cell(&stack, &stack_cap, &sp, idx + 1, visited);
+                if (rc != GMIF_OK) goto done;
+            }
+            if (z == 0 || !mask[idx - sx]) c.edges++;
+            else {
+                rc = push_cell(&stack, &stack_cap, &sp, idx - sx, visited);
+                if (rc != GMIF_OK) goto done;
+            }
+            if (z == sz - 1 || !mask[idx + sx]) c.edges++;
+            else {
+                rc = push_cell(&stack, &stack_cap, &sp, idx + sx, visited);
+                if (rc != GMIF_OK) goto done;
+            }
+
             if (x < c.min_sx) c.min_sx = x;
             if (x > c.max_sx) c.max_sx = x;
             if (z < c.min_sz) c.min_sz = z;
             if (z > c.max_sz) c.max_sz = z;
-
-            if (x + 1 < sx && mask[idx + 1] && !labels[idx + 1]) {
-                labels[idx + 1] = n;
-                stack[sp++] = idx + 1;
-            }
-            if (x - 1 >= 0 && mask[idx - 1] && !labels[idx - 1]) {
-                labels[idx - 1] = n;
-                stack[sp++] = idx - 1;
-            }
-            if (z + 1 < sz && mask[idx + sx] && !labels[idx + sx]) {
-                labels[idx + sx] = n;
-                stack[sp++] = idx + sx;
-            }
-            if (z - 1 >= 0 && mask[idx - sx] && !labels[idx - sx]) {
-                labels[idx - sx] = n;
-                stack[sp++] = idx - sx;
-            }
         }
 
-        comps[n - 1] = c;
+        rc = comp_push(&comps, &c);
+        if (rc != GMIF_OK) goto done;
     }
 
+done:
     free(stack);
-    *out_comps = comps;
-    *out_n = n;
-    return 0;
-}
-
-static int64_t count_boundary_edges(const int *labels, int label,
-                                    int sx, int sz)
-{
-    int64_t edges = 0;
-    for (int z = 0; z < sz; z++) {
-        for (int x = 0; x < sx; x++) {
-            int i = z * sx + x;
-            if (labels[i] != label) continue;
-            if (x == 0     || labels[i - 1]  != label) edges++;
-            if (x == sx-1  || labels[i + 1]  != label) edges++;
-            if (z == 0     || labels[i - sx] != label) edges++;
-            if (z == sz-1  || labels[i + sx] != label) edges++;
-        }
+    free(visited);
+    if (rc == GMIF_ERR_ALLOC) {
+        free(comps.a);
+        return gmif_fail(GMIF_ERR_ALLOC, "allocation failed while growing component list");
     }
-    return edges;
-}
-
-/* ------------------------------------------------------------------ */
-/* coarse scan                                                         */
-/* ------------------------------------------------------------------ */
-
-static int scan_region(const Generator *g, int scale, int radius,
-                       int y, int include_shore, int threads,
-                       unsigned char **out_mask,
-                       int *out_sx, int *out_sz,
-                       int *out_origin_x, int *out_origin_z,
-                       SearchCtx *ctx)
-{
-    int half = 0, sx = 0, sz = 0;
-    int64_t cells = 0, mask_bytes = 0, biome_bytes = 0;
-    int drc = gmif_describe_grid(radius, scale,
-                                 &half, &sx, &sz,
-                                 &cells, &mask_bytes, &biome_bytes);
-    if (drc != GMIF_OK) {
-        return drc; /* message already set */
+    if (rc != GMIF_OK) {
+        free(comps.a);
+        return rc;
     }
-
-    int world_x0 = -half * scale;
-    int world_z0 = -half * scale;
-
-    unsigned char *mask = (unsigned char *)malloc((size_t)cells);
-    if (!mask) {
-        return gmif_fail(GMIF_ERR_ALLOC,
-            "allocation failed: mask %lld bytes (radius=%d scale=%d grid=%dx%d)",
-            (long long)mask_bytes, radius, scale, sx, sz);
-    }
-    memset(mask, 0, (size_t)cells);
-
-    Range r;
-    r.scale = scale;
-    r.x = -half;
-    r.z = -half;
-    r.sx = sx;
-    r.sz = sz;
-    r.y = y;
-    r.sy = 1;
-
-    int *biomeIds = allocCache(g, r);
-    if (!biomeIds) {
-        free(mask);
-        return gmif_fail(GMIF_ERR_ALLOC,
-            "allocation failed: biome cache ≥%lld bytes (radius=%d scale=%d grid=%dx%d). "
-            "Check available RAM.",
-            (long long)biome_bytes, radius, scale, sx, sz);
-    }
-
-    report(ctx, 0, "scan");
-    if (should_stop(ctx)) {
-        free(biomeIds);
-        free(mask);
-        return GMIF_ERR_CANCELLED;
-    }
-
-    /* Stable mask: scale>4 is decimated from scale=4 so tiled == monolithic. */
-    {
-        int frc = gmif_fill_mask_range(g, scale, -half, -half, sx, sz,
-                                       include_shore, mask);
-        if (frc != GMIF_OK) {
-            free(biomeIds);
-            free(mask);
-            return frc;
-        }
-    }
-    free(biomeIds);
-    report(ctx, 70, "scan");
-
-    if (should_stop(ctx)) {
-        free(mask);
-        return GMIF_ERR_CANCELLED;
-    }
-
-    report(ctx, 70, "connect");
-    *out_mask = mask;
-    *out_sx = sx;
-    *out_sz = sz;
-    *out_origin_x = world_x0;
-    *out_origin_z = world_z0;
-    return 0;
+    *out_comps = comps.a;
+    *out_n = comps.n;
+    return GMIF_OK;
 }
 
 /* ------------------------------------------------------------------ */
 /* refine                                                              */
 /* ------------------------------------------------------------------ */
 
-static int refine_component(const Generator *g,
-                            int coarse_scale, int fine_scale,
-                            int world_x0, int world_z0,
-                            const Component *c, int include_shore,
-                            MushroomIsland *out,
-                            SearchCtx *ctx)
+static void finalize_island(MushroomIsland *isl, const SearchParams *p,
+                            int64_t area, int64_t samples, int precision)
 {
-    int pad = coarse_scale * 2;
-    int bx0 = world_x0 + c->min_sx * coarse_scale - pad;
-    int bz0 = world_z0 + c->min_sz * coarse_scale - pad;
-    int bx1 = world_x0 + (c->max_sx + 1) * coarse_scale + pad;
-    int bz1 = world_z0 + (c->max_sz + 1) * coarse_scale + pad;
-
-    int sx = (bx1 - bx0) / fine_scale;
-    int sz = (bz1 - bz0) / fine_scale;
-    if (sx < 1) sx = 1;
-    if (sz < 1) sz = 1;
-    if ((int64_t)sx * sz > 8000000) return 0;
-
-    Range r;
-    r.scale = fine_scale;
-    r.x = bx0 / fine_scale;
-    r.z = bz0 / fine_scale;
-    r.sx = sx;
-    r.sz = sz;
-    r.y = (fine_scale == 1) ? 63 : 15;
-    r.sy = 1;
-
-    int *biomeIds = allocCache(g, r);
-    if (!biomeIds) return -1;
-
-    if (should_stop(ctx)) {
-        free(biomeIds);
-        return -2;
-    }
-    if (genBiomes(g, biomeIds, r) != 0) {
-        free(biomeIds);
-        return -1;
-    }
-
-    int64_t samples = 0;
-    int min_sx = sx, max_sx = -1, min_sz = sz, max_sz = -1;
-    unsigned char *mask = (unsigned char *)malloc((size_t)sx * sz);
-    if (!mask) {
-        free(biomeIds);
-        return -1;
-    }
-    for (int z = 0; z < sz; z++) {
-        for (int x = 0; x < sx; x++) {
-            int i = z * sx + x;
-            int hit = is_target_biome(biomeIds[i], include_shore);
-            mask[i] = (unsigned char)hit;
-            if (hit) {
-                samples++;
-                if (x < min_sx) min_sx = x;
-                if (x > max_sx) max_sx = x;
-                if (z < min_sz) min_sz = z;
-                if (z > max_sz) max_sz = z;
-            }
-        }
-    }
-    free(biomeIds);
-
-    if (samples == 0 || max_sx < 0) {
-        free(mask);
-        return 0;
-    }
-
-    int64_t area = samples * (int64_t)fine_scale * (int64_t)fine_scale;
-    int w_blocks = (max_sx - min_sx + 1) * fine_scale;
-    int h_blocks = (max_sz - min_sz + 1) * fine_scale;
-    int cx = bx0 + ((min_sx + max_sx + 1) / 2) * fine_scale;
-    int cz = bz0 + ((min_sz + max_sz + 1) / 2) * fine_scale;
-
-    int64_t edges = 0;
-    for (int z = 0; z < sz; z++) {
-        for (int x = 0; x < sx; x++) {
-            int i = z * sx + x;
-            if (!mask[i]) continue;
-            if (x == 0     || !mask[i - 1])  edges++;
-            if (x == sx-1  || !mask[i + 1])  edges++;
-            if (z == 0     || !mask[i - sx]) edges++;
-            if (z == sz-1  || !mask[i + sx]) edges++;
-        }
-    }
-    free(mask);
-
-    out->center_x = cx;
-    out->center_z = cz;
-    out->min_x = bx0 + min_sx * fine_scale;
-    out->max_x = bx0 + (max_sx + 1) * fine_scale - 1;
-    out->min_z = bz0 + min_sz * fine_scale;
-    out->max_z = bz0 + (max_sz + 1) * fine_scale - 1;
-    out->width = w_blocks;
-    out->height = h_blocks;
-    out->diagonal_span = sqrt((double)w_blocks * w_blocks + (double)h_blocks * h_blocks);
-    out->area = area;
-    out->samples = samples;
-    out->area_precision = (fine_scale == 1) ? 2 : 1;
-    out->perimeter = (int)(edges * fine_scale);
-    out->distance = dist2d((double)cx, (double)cz);
+    isl->area = area;
+    isl->samples = samples;
+    isl->area_precision = precision;
+    isl->width = isl->max_x - isl->min_x + 1;
+    isl->height = isl->max_z - isl->min_z + 1;
+    isl->diagonal_span = sqrt((double)isl->width * isl->width
+                            + (double)isl->height * isl->height);
+    isl->distance = dist_from_center(isl->center_x, isl->center_z,
+                                     p->center_x, p->center_z);
     {
-        double A = (double)area;
-        double P = (double)out->perimeter;
-        out->compactness = (P > 0) ? (4.0 * 3.141592653589793 * A) / (P * P) : 0.0;
+        double A = (double)isl->area;
+        double P = (double)isl->perimeter;
+        isl->compactness = (P > 0) ? (4.0 * 3.141592653589793 * A) / (P * P) : 0.0;
     }
-    return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* public entry                                                        */
-/* ------------------------------------------------------------------ */
-
-static int cmp_area_desc(const void *a, const void *b)
-{
-    const MushroomIsland *ia = (const MushroomIsland *)a;
-    const MushroomIsland *ib = (const MushroomIsland *)b;
-    if (ia->area != ib->area)
-        return (ia->area < ib->area) ? 1 : -1;
-    /* Stable tie-break so mono/tiled orders match. */
-    if (ia->min_x != ib->min_x) return (ia->min_x < ib->min_x) ? -1 : 1;
-    if (ia->min_z != ib->min_z) return (ia->min_z < ib->min_z) ? -1 : 1;
-    return 0;
-}
-
-int gmif_search(const SearchParams *params,
-                MushroomIsland **out, int *out_count,
-                ProgressFn progress, CancelFn cancel, GmifControl *control,
-                void *userdata)
-{
-    gmif_clear_error();
-    if (!params || !out || !out_count) {
-        return gmif_fail(GMIF_ERR_INVALID_ARG, "null argument to gmif_search");
-    }
-
-    int scale = params->scale > 0 ? params->scale : GMIF_SCALE_CHUNK;
-    if (scale != 1 && scale != 4 && scale != 16 && scale != 64 && scale != 256)
-        scale = GMIF_SCALE_CHUNK;
-
-    int use_tiles = params->use_tiles;
-    if (use_tiles < 0 || use_tiles > 2) use_tiles = 2;
-
-    if (use_tiles == 1) {
-        return gmif_search_tiled(params, out, out_count,
-                                 progress, cancel, control, userdata);
-    }
-    if (use_tiles == 2) {
-        /* auto: monolithic only if the *stable fill* buffer is modest.
-         * scale>4 is decimated from scale=4 (16x cells at scale 16). */
-        int half = 0, sx = 0, sz = 0;
-        int64_t cells = 0, mb = 0, bb = 0;
-        int drc = gmif_describe_grid(params->radius, scale,
-                                     &half, &sx, &sz, &cells, &mb, &bb);
-        int64_t fill_cells = cells;
-        if (scale > 4) {
-            int64_t f = (int64_t)(scale / 4);
-            fill_cells = cells * f * f;
-        }
-        if (drc != GMIF_OK || fill_cells > 40000000LL) {
-            return gmif_search_tiled(params, out, out_count,
-                                     progress, cancel, control, userdata);
-        }
-        /* fall through to monolithic */
-    }
-
-    *out = NULL;
-    *out_count = 0;
-
-    SearchCtx ctx;
-    ctx.progress = progress;
-    ctx.cancel = cancel;
-    ctx.ud = userdata;
-    ctx.control = control;
-    ctx.found = 0;
-
-    if (params->mc < 0) {
-        return gmif_fail(GMIF_ERR_VERSION, "invalid Minecraft version id %d", params->mc);
-    }
-
-    /* Validate grid geometry before touching Cubiomes. */
-    {
-        int half = 0, sx = 0, sz = 0;
-        int64_t cells = 0, mb = 0, bb = 0;
-        int drc = gmif_describe_grid(params->radius, scale,
-                                     &half, &sx, &sz, &cells, &mb, &bb);
-        if (drc != GMIF_OK) return drc;
-    }
-
-    Generator g;
-    setupGenerator(&g, params->mc, 0);
-    applySeed(&g, DIM_OVERWORLD, (uint64_t)params->seed);
-
-    int y = (scale == 1) ? 63 : 15;
-
-    unsigned char *mask = NULL;
-    int sx = 0, sz = 0, wx0 = 0, wz0 = 0;
-    int rc = scan_region(&g, scale, params->radius, y,
-                         params->include_shore, params->threads,
-                         &mask, &sx, &sz, &wx0, &wz0, &ctx);
-    if (rc != 0) return rc;
-
-    int *labels = (int *)malloc((size_t)sx * (size_t)sz * sizeof(int));
-    if (!labels) {
-        free(mask);
-        return gmif_fail(GMIF_ERR_ALLOC,
-            "allocation failed: CCA labels %lld bytes (grid=%dx%d)",
-            (long long)((int64_t)sx * sz * 4), sx, sz);
-    }
-
-    Component *comps = NULL;
-    int ncomp = 0;
-    rc = extract_components(mask, sx, sz, labels, &comps, &ncomp, &ctx);
-    if (rc != 0) {
-        free(labels);
-        free(mask);
-        free(comps);
-        return rc;
-    }
-
-    report(&ctx, 78, "refine");
-
-    int cap = ncomp > 0 ? ncomp : 1;
-    MushroomIsland *islands = (MushroomIsland *)calloc((size_t)cap, sizeof(MushroomIsland));
-    if (!islands) {
-        free(labels);
-        free(mask);
-        free(comps);
-        return gmif_fail(GMIF_ERR_ALLOC, "allocation failed: island list");
-    }
-
-    int kept = 0;
-    int fine = params->refine ? (scale > 4 ? 4 : 1) : scale;
-
-    for (int ci = 0; ci < ncomp; ci++) {
-        if (should_stop(&ctx)) {
-            free(labels);
-            free(mask);
-            free(comps);
-            free(islands);
-            return GMIF_ERR_CANCELLED;
-        }
-        if (ncomp > 0) {
-            /* refine/statistics: 78–98 */
-            int pct = 78 + (int)((int64_t)ci * 20 / ncomp);
-            if (pct > 98) pct = 98;
-            report(&ctx, pct, "refine");
-        }
-
-        const Component *c = &comps[ci];
-        MushroomIsland isl;
-        memset(&isl, 0, sizeof(isl));
-
-        int did_refine = 0;
-        if (params->refine) {
-            did_refine = refine_component(&g, scale, fine,
-                                          wx0, wz0, c,
-                                          params->include_shore,
-                                          &isl, &ctx);
-            if (did_refine < 0) {
-                free(labels);
-                free(mask);
-                free(comps);
-                free(islands);
-                return did_refine;
-            }
-        }
-
-        if (!did_refine) {
-            int label = ci + 1;
-            int64_t samples = c->samples;
-            int64_t area = samples * (int64_t)scale * (int64_t)scale;
-            int min_x = wx0 + c->min_sx * scale;
-            int max_x = wx0 + (c->max_sx + 1) * scale - 1;
-            int min_z = wz0 + c->min_sz * scale;
-            int max_z = wz0 + (c->max_sz + 1) * scale - 1;
-            int64_t bedges = count_boundary_edges(labels, label, sx, sz);
-
-            isl.center_x = (min_x + max_x) / 2;
-            isl.center_z = (min_z + max_z) / 2;
-            isl.min_x = min_x;
-            isl.max_x = max_x;
-            isl.min_z = min_z;
-            isl.max_z = max_z;
-            isl.width = max_x - min_x + 1;
-            isl.height = max_z - min_z + 1;
-            isl.diagonal_span = sqrt((double)isl.width * isl.width
-                                   + (double)isl.height * isl.height);
-            isl.area = area;
-            isl.samples = samples;
-            isl.area_precision = 0;
-            isl.perimeter = (int)(bedges * scale);
-            isl.distance = dist2d((double)isl.center_x, (double)isl.center_z);
-            {
-                double A = (double)isl.area;
-                double P = (double)isl.perimeter;
-                isl.compactness = (P > 0) ? (4.0 * 3.141592653589793 * A) / (P * P) : 0.0;
-            }
-        }
-
-        if (isl.area >= params->min_area) {
-            islands[kept++] = isl;
-            ctx.found = kept;
-        }
-    }
-
-    free(labels);
-    free(mask);
-    free(comps);
-
-    if (kept > 1)
-        qsort(islands, (size_t)kept, sizeof(MushroomIsland), cmp_area_desc);
-
-    /* Result-layer only: keep top-N by area. Does not change CCA. */
-    if (params->max_results > 0 && kept > params->max_results)
-        kept = params->max_results;
-
-    report(&ctx, 100, "done");
-
-    *out = islands;
-    *out_count = kept;
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* verification helpers (Cubiomes cross-check)                         */
-/* ------------------------------------------------------------------ */
-
-int gmif_sample_biome(int64_t seed, int mc, int x, int z)
-{
-    if (mc < 0) return -1;
-    Generator g;
-    setupGenerator(&g, mc, 0);
-    applySeed(&g, DIM_OVERWORLD, (uint64_t)seed);
-    return getBiomeAt(&g, 1, x, 63, z);
-}
-
-int gmif_is_mushroom(int biome_id, int include_shore)
-{
-    return is_target_biome(biome_id, include_shore);
-}
-
-int gmif_fill_mask_range(const void *generator, int scale,
-                         int ox, int oz, int sx, int sz,
-                         int include_shore, unsigned char *mask)
+int gmif_refine_island(const void *generator, const SearchParams *params,
+                       int coarse_scale, int fine_scale, MushroomIsland *isl)
 {
     const Generator *g = (const Generator *)generator;
-    if (!g || !mask || sx <= 0 || sz <= 0) return GMIF_ERR_INVALID_ARG;
-
-    if (scale > 4) {
-        /* Decimate from stable scale=4 samples (opt disabled at scale<=4). */
-        int factor = scale / 4;
-        int fx = sx * factor;
-        int fz = sz * factor;
-        Range r;
-        r.scale = 4;
-        r.x = ox * factor;
-        r.z = oz * factor;
-        r.sx = fx;
-        r.sz = fz;
-        r.y = 15;
-        r.sy = 1;
-        int *ids = allocCache(g, r);
-        if (!ids) {
-            return gmif_set_error(GMIF_ERR_ALLOC,
-                "allocation failed: scale4 window %dx%d", fx, fz);
-        }
-        if (genBiomes(g, ids, r) != 0) {
-            free(ids);
-            return gmif_set_error(GMIF_ERR_BIOME_GEN,
-                "biome sampling failed (scale4 window %dx%d)", fx, fz);
-        }
-        int mid = factor / 2;
-        for (int z = 0; z < sz; z++) {
-            for (int x = 0; x < sx; x++) {
-                int sxi = x * factor + mid;
-                int szi = z * factor + mid;
-                if (sxi >= fx) sxi = fx - 1;
-                if (szi >= fz) szi = fz - 1;
-                mask[z * sx + x] =
-                    is_target_biome(ids[(size_t)szi * fx + sxi], include_shore) ? 1 : 0;
-            }
-        }
-        free(ids);
-        return GMIF_OK;
-    }
-
-    /* scale 1 or 4: generate directly at that scale. */
-    Range r;
-    r.scale = scale;
-    r.x = ox;
-    r.z = oz;
-    r.sx = sx;
-    r.sz = sz;
-    r.y = (scale == 1) ? 63 : 15;
-    r.sy = 1;
-    int *ids = allocCache(g, r);
-    if (!ids) {
-        return gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: mask window %dx%d", sx, sz);
-    }
-    if (genBiomes(g, ids, r) != 0) {
-        free(ids);
-        return gmif_set_error(GMIF_ERR_BIOME_GEN, "biome sampling failed (%dx%d)", sx, sz);
-    }
-    size_t n = (size_t)sx * (size_t)sz;
-    for (size_t i = 0; i < n; i++)
-        mask[i] = is_target_biome(ids[i], include_shore) ? 1 : 0;
-    free(ids);
-    return GMIF_OK;
-}
-
-int gmif_refine_island(const void *generator, int coarse_scale, int fine_scale,
-                       int include_shore, MushroomIsland *isl)
-{
-    const Generator *g = (const Generator *)generator;
-    if (!g || !isl) return GMIF_ERR_INVALID_ARG;
+    if (!g || !params || !isl) return GMIF_ERR_INVALID_ARG;
     if (fine_scale != 1 && fine_scale != 4) fine_scale = 4;
 
     int pad = coarse_scale * 2;
-    int bx0 = isl->min_x - pad;
-    int bz0 = isl->min_z - pad;
-    int bx1 = isl->max_x + pad;
-    int bz1 = isl->max_z + pad;
-    int w = (bx1 - bx0) / fine_scale + 1;
-    int h = (bz1 - bz0) / fine_scale + 1;
-    if (w < 1) w = 1;
-    if (h < 1) h = 1;
-    if ((int64_t)w * h > 4000000) return 0;
+    int64_t bx0 = (int64_t)isl->min_x - pad;
+    int64_t bz0 = (int64_t)isl->min_z - pad;
+    int64_t bx1 = (int64_t)isl->max_x + pad;
+    int64_t bz1 = (int64_t)isl->max_z + pad;
+    if (bx0 < -30000000) bx0 = -30000000;
+    if (bz0 < -30000000) bz0 = -30000000;
+    if (bx1 > 30000000) bx1 = 30000000;
+    if (bz1 > 30000000) bz1 = 30000000;
+    if (bx1 < bx0 || bz1 < bz0) return 0;
 
-    int ox = bx0 / fine_scale;
-    int oz = bz0 / fine_scale;
-    unsigned char *mask = (unsigned char *)malloc((size_t)w * h);
-    if (!mask) return GMIF_ERR_ALLOC;
-    int rc = gmif_fill_mask_range(g, fine_scale, ox, oz, w, h,
-                                  include_shore, mask);
+    int64_t ox = floor_div(bx0, fine_scale);
+    int64_t oz = floor_div(bz0, fine_scale);
+    int64_t aligned_x0 = ox * fine_scale;
+    int64_t aligned_z0 = oz * fine_scale;
+    int64_t w64 = (bx1 - aligned_x0) / fine_scale + 1;
+    int64_t h64 = (bz1 - aligned_z0) / fine_scale + 1;
+    if (w64 < 1) w64 = 1;
+    if (h64 < 1) h64 = 1;
+    if (w64 * h64 > 4000000LL) return 0;
+    if (w64 > INT32_MAX || h64 > INT32_MAX) return 0;
+
+    int w = (int)w64;
+    int h = (int)h64;
+    unsigned char *mask = (unsigned char *)malloc((size_t)w * (size_t)h);
+    if (!mask) return gmif_fail(GMIF_ERR_ALLOC,
+        "allocation failed: refine mask %dx%d", w, h);
+
+    int rc = gmif_fill_mask_range(g, params, fine_scale, ox, oz, w, h,
+                                  mask, NULL, -1, -1);
     if (rc != GMIF_OK) {
         free(mask);
         return rc;
     }
 
-    int64_t samples = 0;
+    int64_t samples = 0, edges = 0;
     int min_sx = w, max_sx = -1, min_sz = h, max_sz = -1;
-    int64_t edges = 0;
     for (int z = 0; z < h; z++) {
         for (int x = 0; x < w; x++) {
             int i = z * w + x;
@@ -954,32 +980,225 @@ int gmif_refine_island(const void *generator, int coarse_scale, int fine_scale,
     free(mask);
     if (samples == 0 || max_sx < 0) return 0;
 
-    int min_x = bx0 + min_sx * fine_scale;
-    int max_x = bx0 + (max_sx + 1) * fine_scale - 1;
-    int min_z = bz0 + min_sz * fine_scale;
-    int max_z = bz0 + (max_sz + 1) * fine_scale - 1;
-    isl->min_x = min_x;
-    isl->max_x = max_x;
-    isl->min_z = min_z;
-    isl->max_z = max_z;
-    /* Same center formula as monolithic refine_component. */
-    isl->center_x = bx0 + ((min_sx + max_sx + 1) / 2) * fine_scale;
-    isl->center_z = bz0 + ((min_sz + max_sz + 1) / 2) * fine_scale;
-    isl->width = max_x - min_x + 1;
-    isl->height = max_z - min_z + 1;
-    isl->diagonal_span = sqrt((double)isl->width * isl->width
-                            + (double)isl->height * isl->height);
-    isl->samples = samples;
-    isl->area = samples * (int64_t)fine_scale * (int64_t)fine_scale;
-    isl->area_precision = (fine_scale == 1) ? 2 : 1;
+    isl->min_x = (int)(aligned_x0 + (int64_t)min_sx * fine_scale);
+    isl->max_x = (int)(aligned_x0 + (int64_t)(max_sx + 1) * fine_scale - 1);
+    isl->min_z = (int)(aligned_z0 + (int64_t)min_sz * fine_scale);
+    isl->max_z = (int)(aligned_z0 + (int64_t)(max_sz + 1) * fine_scale - 1);
+    isl->center_x = (int)(aligned_x0 + ((int64_t)(min_sx + max_sx + 1) / 2) * fine_scale);
+    isl->center_z = (int)(aligned_z0 + ((int64_t)(min_sz + max_sz + 1) / 2) * fine_scale);
     isl->perimeter = (int)(edges * fine_scale);
-    isl->distance = dist2d((double)isl->center_x, (double)isl->center_z);
-    {
-        double A = (double)isl->area;
-        double P = (double)isl->perimeter;
-        isl->compactness = (P > 0) ? (4.0 * 3.141592653589793 * A) / (P * P) : 0.0;
-    }
+    finalize_island(isl, params,
+                    samples * (int64_t)fine_scale * (int64_t)fine_scale,
+                    samples, (fine_scale == 1) ? 2 : 1);
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* monolithic search                                                   */
+/* ------------------------------------------------------------------ */
+
+static int cmp_area_desc(const void *a, const void *b)
+{
+    const MushroomIsland *ia = (const MushroomIsland *)a;
+    const MushroomIsland *ib = (const MushroomIsland *)b;
+    if (ia->area != ib->area)
+        return (ia->area < ib->area) ? 1 : -1;
+    /* Total tie-break so mono/tiled and thread counts always order equally. */
+    if (ia->min_x != ib->min_x) return (ia->min_x < ib->min_x) ? -1 : 1;
+    if (ia->min_z != ib->min_z) return (ia->min_z < ib->min_z) ? -1 : 1;
+    if (ia->max_x != ib->max_x) return (ia->max_x < ib->max_x) ? -1 : 1;
+    if (ia->max_z != ib->max_z) return (ia->max_z < ib->max_z) ? -1 : 1;
+    return 0;
+}
+
+/** Upper bound on the area a coarse component can reach after refinement. */
+static int64_t refined_area_upper_bound(const Component *c, int scale)
+{
+    int pad = scale * 2;
+    int64_t w = ((int64_t)c->max_sx - c->min_sx + 1) * scale + 2LL * pad;
+    int64_t h = ((int64_t)c->max_sz - c->min_sz + 1) * scale + 2LL * pad;
+    return w * h;
+}
+
+static int search_monolithic(const SearchParams *p, const GmifSearchPlan *plan,
+                             MushroomIsland **out, int *out_count,
+                             SearchCtx *ctx, Generator *g)
+{
+    *out = NULL;
+    *out_count = 0;
+
+    int sx = (int)plan->sx;
+    int sz = (int)plan->sz;
+    unsigned char *mask = (unsigned char *)malloc((size_t)sx * (size_t)sz);
+    if (!mask) {
+        return gmif_fail(GMIF_ERR_ALLOC,
+            "allocation failed: mask %.1f MB (grid %dx%d)",
+            (double)sx * sz / (1024.0 * 1024.0), sx, sz);
+    }
+    memset(mask, 0, (size_t)sx * (size_t)sz);
+
+    int rc = gmif_fill_mask_range(g, p, plan->scale, plan->cell_x0, plan->cell_z0,
+                                  sx, sz, mask, ctx->control, 0, 60);
+    if (rc != GMIF_OK) {
+        free(mask);
+        return rc;
+    }
+    if (should_stop(ctx)) {
+        free(mask);
+        return GMIF_ERR_CANCELLED;
+    }
+
+    report(ctx, 60, "connect");
+    Component *comps = NULL;
+    int ncomp = 0;
+    rc = extract_components(mask, sx, sz, &comps, &ncomp, ctx);
+    free(mask);
+    if (rc != GMIF_OK) return rc;
+
+    report(ctx, 70, "refine");
+
+    int cap = ncomp > 0 ? ncomp : 1;
+    MushroomIsland *islands = (MushroomIsland *)calloc((size_t)cap, sizeof(MushroomIsland));
+    if (!islands) {
+        free(comps);
+        return gmif_fail(GMIF_ERR_ALLOC, "allocation failed: island list");
+    }
+
+    int kept = 0;
+    int fine = p->refine ? (plan->scale > 4 ? 4 : 1) : plan->scale;
+
+    for (int ci = 0; ci < ncomp; ci++) {
+        if (should_stop(ctx)) {
+            free(comps);
+            free(islands);
+            return GMIF_ERR_CANCELLED;
+        }
+        if ((ci & 15) == 0 || ci + 1 == ncomp) {
+            int pct = 70 + (ncomp > 0 ? (int)((int64_t)ci * 28 / ncomp) : 0);
+            if (pct > 98) pct = 98;
+            report(ctx, pct, "refine");
+        }
+
+        const Component *c = &comps[ci];
+        MushroomIsland isl;
+        memset(&isl, 0, sizeof(isl));
+
+        /* Coarse geometry is needed both as the fallback result and as the
+         * bounding box handed to the refiner. */
+        {
+            int64_t samples = c->samples;
+            int64_t area = samples * (int64_t)plan->scale * (int64_t)plan->scale;
+            int64_t min_x = plan->world_x0 + (int64_t)c->min_sx * plan->scale;
+            int64_t max_x = plan->world_x0 + (int64_t)(c->max_sx + 1) * plan->scale - 1;
+            int64_t min_z = plan->world_z0 + (int64_t)c->min_sz * plan->scale;
+            int64_t max_z = plan->world_z0 + (int64_t)(c->max_sz + 1) * plan->scale - 1;
+            isl.min_x = (int)min_x;
+            isl.max_x = (int)max_x;
+            isl.min_z = (int)min_z;
+            isl.max_z = (int)max_z;
+            isl.center_x = (int)((min_x + max_x) / 2);
+            isl.center_z = (int)((min_z + max_z) / 2);
+            isl.perimeter = (int)(c->edges * plan->scale);
+            finalize_island(&isl, p, area, samples, 0);
+        }
+
+        int did_refine = 0;
+        if (p->refine) {
+            if (p->min_area > 0
+                && refined_area_upper_bound(c, plan->scale) < p->min_area) {
+                continue; /* cannot possibly pass the filter */
+            }
+            did_refine = gmif_refine_island(g, p, plan->scale, fine, &isl);
+            if (did_refine < 0) {
+                free(comps);
+                free(islands);
+                return did_refine;
+            }
+        }
+        (void)did_refine;
+
+        if (isl.area >= p->min_area) {
+            islands[kept++] = isl;
+            ctx->found = kept;
+        }
+    }
+
+    free(comps);
+
+    if (kept > 1)
+        qsort(islands, (size_t)kept, sizeof(MushroomIsland), cmp_area_desc);
+
+    if (p->max_results > 0 && kept > p->max_results)
+        kept = p->max_results;
+
+    report(ctx, 100, "done");
+    *out = islands;
+    *out_count = kept;
+    return GMIF_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* public entry                                                        */
+/* ------------------------------------------------------------------ */
+
+int gmif_search(const SearchParams *params,
+                MushroomIsland **out, int *out_count,
+                ProgressFn progress, CancelFn cancel, GmifControl *control,
+                void *userdata)
+{
+    gmif_clear_error();
+    if (!params || !out || !out_count) {
+        return gmif_fail(GMIF_ERR_INVALID_ARG, "null argument to gmif_search");
+    }
+
+    GmifSearchPlan plan;
+    int rc = gmif_plan_search(params, &plan);
+    if (rc != GMIF_OK) return rc;
+
+    if (plan.use_tiles) {
+        return gmif_search_tiled(params, out, out_count,
+                                 progress, cancel, control, userdata);
+    }
+
+    SearchCtx ctx;
+    ctx.progress = progress;
+    ctx.cancel = cancel;
+    ctx.ud = userdata;
+    ctx.control = control;
+    ctx.found = 0;
+    ctx.mode = 0;
+
+    if (control) {
+        control->mode = 0;
+        control->percent = 0;
+        control->stage = 0;
+        control->found = 0;
+    }
+
+    Generator g;
+    setupGenerator(&g, params->mc, 0);
+    applySeed(&g, DIM_OVERWORLD, (uint64_t)params->seed);
+
+    report(&ctx, 0, "scan");
+    rc = search_monolithic(params, &plan, out, out_count, &ctx, &g);
+    if (rc != GMIF_OK) {
+        *out = NULL;
+        *out_count = 0;
+    }
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* verification helpers (Cubiomes cross-check)                         */
+/* ------------------------------------------------------------------ */
+
+int gmif_sample_biome(int64_t seed, int mc, int x, int z)
+{
+    if (mc < 0) return -1;
+    Generator g;
+    setupGenerator(&g, mc, 0);
+    applySeed(&g, DIM_OVERWORLD, (uint64_t)seed);
+    return getBiomeAt(&g, 1, x, 63, z);
 }
 
 int64_t gmif_dump_ascii_map(int64_t seed, int mc,
@@ -998,22 +1217,9 @@ int64_t gmif_dump_ascii_map(int64_t seed, int mc,
     size_t need = (size_t)rows * ((size_t)cols + 1) + 1;
     if (need > out_cap) return 0;
 
-    /* Use genBiomes at block scale for accuracy on small maps. */
-    Range r;
-    r.scale = 1;
-    r.x = x0;
-    r.z = z0;
-    r.sx = cols;
-    r.sz = rows;
-    r.y = 63;
-    r.sy = 1;
-
-    /* Sample at step by generating a denser grid when step > 1:
-     * generate full block range only if area is small; else sample. */
     int64_t hits = 0;
     size_t o = 0;
     if ((int64_t)cols * rows > 200000) {
-        /* sparse: getBiomeAt per cell */
         for (int zi = 0; zi < rows; zi++) {
             for (int xi = 0; xi < cols; xi++) {
                 int id = getBiomeAt(&g, 1, x0 + xi * step, 63, z0 + zi * step);
@@ -1027,11 +1233,16 @@ int64_t gmif_dump_ascii_map(int64_t seed, int mc,
         return hits;
     }
 
-    /* Dense path: generate every block in the rect, then downsample display */
     int w = (x1 - x0) + 1;
     int h = (z1 - z0) + 1;
+    Range r;
+    r.scale = 1;
+    r.x = x0;
+    r.z = z0;
     r.sx = w;
     r.sz = h;
+    r.y = 63;
+    r.sy = 1;
     int *ids = allocCache(&g, r);
     if (!ids) return 0;
     if (genBiomes(&g, ids, r) != 0) {

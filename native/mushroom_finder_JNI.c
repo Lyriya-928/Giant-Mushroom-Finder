@@ -1,5 +1,5 @@
 /*
- * Giant Mushroom Island Finder — JNI bridge (C)
+ * Large Biome Finder — JNI bridge (C)
  *
  * Architecture inspired by SunnySlopes FortressFinderGUI / RiverFinderGUI
  * (Java GUI + JNI + native search). No source code copied.
@@ -21,9 +21,10 @@
 JNIEXPORT jdoubleArray JNICALL
 Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
     JNIEnv *env, jclass cls,
-    jlong seed, jstring version, jint radius, jlong minArea,
+    jlong seed, jstring version, jint centerX, jint centerZ,
+    jint radius, jlong minArea,
     jint scale, jboolean refine, jboolean includeShore,
-    jlong controlPtr, jint threads, jint maxResults)
+    jlong controlPtr, jint threads, jint maxResults, jintArray biomeIds)
 {
     (void)cls;
     const char *vchars = (*env)->GetStringUTFChars(env, version, NULL);
@@ -32,28 +33,57 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
     (*env)->ReleaseStringUTFChars(env, version, vchars);
     if (mc < 0) return NULL;
 
+    int *biomes = NULL;
+    int biome_count = 0;
+    if (biomeIds) {
+        jsize n = (*env)->GetArrayLength(env, biomeIds);
+        if (n < 0) n = 0;
+        if (n > 0) {
+            biomes = (int *)malloc(sizeof(int) * (size_t)n);
+            if (!biomes) {
+                gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: biome id list");
+                return NULL;
+            }
+            jint *tmp = (jint *)malloc(sizeof(jint) * (size_t)n);
+            if (!tmp) {
+                free(biomes);
+                gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: biome id list");
+                return NULL;
+            }
+            (*env)->GetIntArrayRegion(env, biomeIds, 0, n, tmp);
+            for (jsize i = 0; i < n; i++) biomes[i] = (int)tmp[i];
+            free(tmp);
+            biome_count = (int)n;
+        }
+    }
+
     SearchParams p;
     memset(&p, 0, sizeof(p));
     p.seed = (int64_t)seed;
     p.mc = mc;
+    p.center_x = (int)centerX;
+    p.center_z = (int)centerZ;
     p.radius = (int)radius;
     p.min_area = (int64_t)minArea;
     p.scale = (int)scale;
     p.refine = refine ? 1 : 0;
     p.include_shore = includeShore ? 1 : 0;
-    p.threads = threads > 0 ? (int)threads : 1;
+    p.threads = threads >= 0 ? (int)threads : 0;
     if (p.threads > 256) p.threads = 256;
     p.max_results = maxResults > 0 ? (int)maxResults : 0;
     if (p.radius > 30000000) p.radius = 30000000;
     if (p.radius < 1) p.radius = 1;
-    p.use_tiles = 2; /* auto: tiled when grid would not fit */
+    p.use_tiles = 2; /* auto: monolithic for normal areas, tiled for large ones */
     p.tile_size = 0;
+    p.biome_ids = biomes;
+    p.biome_count = biome_count;
 
     GmifControl *ctrl = (GmifControl *)(intptr_t)controlPtr;
 
     MushroomIsland *islands = NULL;
     int count = 0;
     int rc = gmif_search(&p, &islands, &count, NULL, NULL, ctrl, NULL);
+    free(biomes);
 
     if (rc != 0) {
         free(islands);
@@ -99,18 +129,99 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
     return arr;
 }
 
+/*
+ * nativePlanSearch(version, centerX, centerZ, radius, scale, useTiles, tileSize, threads)
+ * -> long[9] = {mode, tileSize, threads, sx, sz, cells, estSamples, estPeakBytes, scale}
+ * or null on invalid input (message in last error).
+ */
+JNIEXPORT jlongArray JNICALL
+Java_dev_sakuhime_mushroomfinder_NativeBridge_nativePlanSearch(
+    JNIEnv *env, jclass cls,
+    jstring version, jint centerX, jint centerZ, jint radius,
+    jint scale, jint useTiles, jint tileSize, jint threads)
+{
+    (void)cls;
+    const char *vchars = (*env)->GetStringUTFChars(env, version, NULL);
+    if (!vchars) return NULL;
+    int mc = gmif_mc_from_string(vchars);
+    (*env)->ReleaseStringUTFChars(env, version, vchars);
+    if (mc < 0) {
+        gmif_set_error(GMIF_ERR_VERSION, "unknown Minecraft version");
+        return NULL;
+    }
+
+    SearchParams p;
+    memset(&p, 0, sizeof(p));
+    p.mc = mc;
+    p.center_x = (int)centerX;
+    p.center_z = (int)centerZ;
+    p.radius = (int)radius;
+    p.scale = (int)scale;
+    p.use_tiles = (int)useTiles;
+    p.tile_size = (int)tileSize;
+    p.threads = (int)threads;
+
+    GmifSearchPlan plan;
+    int rc = gmif_plan_search(&p, &plan);
+    if (rc != GMIF_OK) return NULL;
+
+    jlong tmp[9];
+    tmp[0] = plan.use_tiles;
+    tmp[1] = plan.tile_size;
+    tmp[2] = plan.threads;
+    tmp[3] = plan.sx;
+    tmp[4] = plan.sz;
+    tmp[5] = plan.cells;
+    tmp[6] = plan.est_samples;
+    tmp[7] = plan.est_peak_bytes;
+    tmp[8] = plan.scale;
+    jlongArray arr = (*env)->NewLongArray(env, 9);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 9, tmp);
+    return arr;
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeDefaultThreads(
+    JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    return gmif_default_threads();
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeMaxRadius(
+    JNIEnv *env, jclass cls, jint scale)
+{
+    (void)env; (void)cls;
+    return gmif_max_radius((int)scale);
+}
+
 JNIEXPORT void JNICALL
 Java_dev_sakuhime_mushroomfinder_NativeBridge_nativePollProgress(
-    JNIEnv *env, jclass cls, jlong ptr, jintArray out3)
+    JNIEnv *env, jclass cls, jlong ptr, jintArray out4)
 {
     (void)cls;
     GmifControl *c = (GmifControl *)(intptr_t)ptr;
-    if (!c || !out3) return;
-    jint tmp[3];
+    if (!c || !out4) return;
+    jint tmp[4];
     tmp[0] = c->percent;
     tmp[1] = (jint)(c->found > 0x7fffffff ? 0x7fffffff : c->found);
     tmp[2] = c->stage;
-    (*env)->SetIntArrayRegion(env, out3, 0, 3, tmp);
+    tmp[3] = c->mode;
+    (*env)->SetIntArrayRegion(env, out4, 0, 4, tmp);
+}
+
+JNIEXPORT jint JNICALL
+Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSampleBiome(
+    JNIEnv *env, jclass cls, jlong seed, jstring version, jint x, jint z)
+{
+    (void)cls;
+    const char *vchars = (*env)->GetStringUTFChars(env, version, NULL);
+    if (!vchars) return -1;
+    int mc = gmif_mc_from_string(vchars);
+    (*env)->ReleaseStringUTFChars(env, version, vchars);
+    if (mc < 0) return -1;
+    return gmif_sample_biome((int64_t)seed, mc, (int)x, (int)z);
 }
 
 JNIEXPORT jstring JNICALL
@@ -212,27 +323,26 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeGetLastErrorCode(
 }
 
 /*
- * describeGrid(radius, scale) -> long[5]
- * [0]=half [1]=sx [2]=sz [3]=cells [4]=biome_bytes
+ * describeGrid(centerX, centerZ, radius, scale) -> long[4]
+ * [0]=sx [1]=sz [2]=cells [3]=mask_bytes
  * On failure returns null; message in last error.
  */
 JNIEXPORT jlongArray JNICALL
 Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeDescribeGrid(
-    JNIEnv *env, jclass cls, jint radius, jint scale)
+    JNIEnv *env, jclass cls, jint centerX, jint centerZ, jint radius, jint scale)
 {
     (void)cls;
-    int half = 0, sx = 0, sz = 0;
-    int64_t cells = 0, mask_b = 0, biome_b = 0;
-    int rc = gmif_describe_grid((int)radius, (int)scale,
-                                &half, &sx, &sz, &cells, &mask_b, &biome_b);
+    int sx = 0, sz = 0;
+    int64_t ox = 0, oz = 0, cells = 0, mask_b = 0;
+    int rc = gmif_describe_grid((int)centerX, (int)centerZ, (int)radius, (int)scale,
+                                &sx, &sz, &ox, &oz, &cells, &mask_b);
     if (rc != 0) return NULL;
-    jlong tmp[5];
-    tmp[0] = half;
-    tmp[1] = sx;
-    tmp[2] = sz;
-    tmp[3] = cells;
-    tmp[4] = biome_b;
-    jlongArray arr = (*env)->NewLongArray(env, 5);
-    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 5, tmp);
+    jlong tmp[4];
+    tmp[0] = sx;
+    tmp[1] = sz;
+    tmp[2] = cells;
+    tmp[3] = mask_b;
+    jlongArray arr = (*env)->NewLongArray(env, 4);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 4, tmp);
     return arr;
 }

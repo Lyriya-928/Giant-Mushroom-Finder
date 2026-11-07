@@ -1,15 +1,18 @@
 /*
- * Giant Mushroom Island Finder 锟?tiled streaming search + DSU merge
+ * Large Biome Finder — tiled streaming search + DSU merge
  *
  * Processes the sample grid in tiles (bounded memory). Each tile runs the
- * same mushroom mask + 4-neighbor CCA as the monolithic path. Regions that
+ * same target mask + 4-neighbor CCA as the monolithic path. Regions that
  * touch tile borders are merged with Union-Find when adjacent tiles share
- * a mushroom-to-mushroom border pair.
+ * a target-to-target border pair.
+ *
+ * The biome sampling inside each tile is parallel over row bands (OpenMP).
+ * Border contacts are streamed one tile row at a time: only the current row
+ * and the previous row's bottom contacts are kept, so memory depends on the
+ * grid width and tile size, not on the total number of tiles. This is what
+ * makes very large radii safe for broad targets such as ocean/plains.
  *
  * CCA semantics unchanged (4-neighbor). Cubiomes not modified.
- *
- * Search tiling + global merge concept inspired by multi-tile region
- * pipelines in seed-finder tools (architecture only; no source copied).
  */
 #include "mushroom_finder.h"
 
@@ -31,8 +34,8 @@
 #include "generator.h"
 #include "util.h"
 
-/* Reuse error helpers from mushroom_finder.c via extern declarations
- * matching those translation units' public API. */
+/** Safety cap for the global DSU list (40 bytes per region). */
+#define GMIF_MAX_REGIONS 4000000
 
 /* ------------------------------------------------------------------ */
 /* local types                                                         */
@@ -44,6 +47,7 @@ typedef struct SearchCtx {
     void *ud;
     GmifControl *control;
     int64_t found;
+    int mode;
 } SearchCtx;
 
 static int should_stop(SearchCtx *ctx)
@@ -64,9 +68,10 @@ static void report(SearchCtx *ctx, int percent, const char *stage)
     if (ctx && ctx->control) {
         ctx->control->percent = percent;
         ctx->control->found = ctx->found;
+        ctx->control->mode = ctx->mode;
         if (stage) {
-            if (stage[0] == 't' && stage[1] == 'i') ctx->control->stage = 4; /* tile */
-            else if (stage[0] == 'm') ctx->control->stage = 5; /* merge */
+            if (stage[0] == 't' && stage[1] == 'i') ctx->control->stage = 4;
+            else if (stage[0] == 'm') ctx->control->stage = 5;
             else if (stage[0] == 's') ctx->control->stage = 0;
             else if (stage[0] == 'c') ctx->control->stage = 1;
             else if (stage[0] == 'r') ctx->control->stage = 2;
@@ -78,18 +83,14 @@ static void report(SearchCtx *ctx, int percent, const char *stage)
     sp.percent = percent;
     sp.stage = stage;
     sp.found = ctx->found;
+    sp.mode = ctx->mode;
     ctx->progress(&sp, ctx->ud);
 }
 
-static int is_target_biome(int id, int include_shore)
+static double dist_from_center(int x, int z, int cx, int cz)
 {
-    if (id == mushroom_fields) return 1;
-    if (include_shore && id == mushroom_field_shore) return 1;
-    return 0;
-}
-
-static double dist2d(double dx, double dz)
-{
+    double dx = (double)x - (double)cx;
+    double dz = (double)z - (double)cz;
     return sqrt(dx * dx + dz * dz);
 }
 
@@ -104,7 +105,7 @@ typedef struct TileRegion {
     /* global sample-grid bounds (inclusive) */
     int min_sx, max_sx, min_sz, max_sz;
     int64_t outer_edges;   /* tile-local exposed edges */
-    int64_t shared_pairs;  /* mushroom adjacencies across tile borders (internal) */
+    int64_t shared_pairs;  /* target adjacencies across tile borders (internal) */
 } TileRegion;
 
 static int dsu_find(TileRegion *a, int i)
@@ -129,10 +130,10 @@ static int dsu_union(TileRegion *a, int i, int j)
     return i;
 }
 
-/* Border contact record: one mushroom cell on a tile edge. */
+/* Border contact record: one target cell on a tile edge. */
 typedef struct BorderCell {
     int32_t region;   /* index into regions[] */
-    int32_t coord;    /* row or col along the edge */
+    int32_t coord;    /* global row or column along the edge */
 } BorderCell;
 
 /* ------------------------------------------------------------------ */
@@ -140,15 +141,15 @@ typedef struct BorderCell {
 /* ------------------------------------------------------------------ */
 
 static int tile_cca(const unsigned char *mask, int w, int h,
-                    int *labels, int *n_out,
-                    /* optional per-cell edge count not stored; we recount */
-                    int64_t *out_samples /* array of w*h is not needed */)
+                    int *labels, int *n_out)
 {
-    (void)out_samples;
     memset(labels, 0, (size_t)w * h * sizeof(int));
     int n = 0;
     int *stack = (int *)malloc((size_t)w * h * sizeof(int));
-    if (!stack) return GMIF_ERR_ALLOC;
+    if (!stack) {
+        return gmif_set_error(GMIF_ERR_ALLOC,
+            "allocation failed: tile CCA stack (%d x %d)", w, h);
+    }
 
     for (int i = 0; i < w * h; i++) {
         if (!mask[i] || labels[i]) continue;
@@ -226,25 +227,49 @@ static void tile_region_stats(const unsigned char *mask, const int *labels,
 static int grow_regions(TileRegion **arr, int *cap, int need)
 {
     if (need <= *cap) return GMIF_OK;
+    if (need > GMIF_MAX_REGIONS) {
+        return gmif_set_error(GMIF_ERR_GRID_TOO_LARGE,
+            "target biome is too fragmented for a single search:\n"
+            "  more than %d connected regions would be required.\n"
+            "  Reduce the radius or use a coarser sample scale.",
+            GMIF_MAX_REGIONS);
+    }
     int ncap = *cap ? *cap : 64;
     while (ncap < need) ncap *= 2;
     TileRegion *na = (TileRegion *)realloc(*arr, (size_t)ncap * sizeof(TileRegion));
-    if (!na) return GMIF_ERR_ALLOC;
+    if (!na) {
+        return gmif_set_error(GMIF_ERR_ALLOC,
+            "allocation failed: region list (%d entries)", ncap);
+    }
     *arr = na;
     *cap = ncap;
     return GMIF_OK;
 }
 
-static int grow_border(BorderCell **arr, int *cap, int need)
+/**
+ * Merge two sorted border contact lists (one tile edge against its neighbour).
+ * Matching coordinates are a 4-neighbour target adjacency and union the two
+ * regions. The pair is counted once; it is subtracted from the summed perimeter
+ * when the final island is built.
+ */
+static void merge_border_lists(TileRegion *regions,
+                               const BorderCell *a, int na,
+                               const BorderCell *b, int nb)
 {
-    if (need <= *cap) return GMIF_OK;
-    int ncap = *cap ? *cap : 256;
-    while (ncap < need) ncap *= 2;
-    BorderCell *na = (BorderCell *)realloc(*arr, (size_t)ncap * sizeof(BorderCell));
-    if (!na) return GMIF_ERR_ALLOC;
-    *arr = na;
-    *cap = ncap;
-    return GMIF_OK;
+    int i = 0, j = 0;
+    while (i < na && j < nb) {
+        if (a[i].coord == b[j].coord) {
+            int ra = dsu_find(regions, a[i].region);
+            int rb = dsu_find(regions, b[j].region);
+            if (ra != rb) dsu_union(regions, ra, rb);
+            regions[a[i].region].shared_pairs++;
+            i++; j++;
+        } else if (a[i].coord < b[j].coord) {
+            i++;
+        } else {
+            j++;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,25 +284,27 @@ static int cmp_area_desc(const void *a, const void *b)
         return (ia->area < ib->area) ? 1 : -1;
     if (ia->min_x != ib->min_x) return (ia->min_x < ib->min_x) ? -1 : 1;
     if (ia->min_z != ib->min_z) return (ia->min_z < ib->min_z) ? -1 : 1;
+    if (ia->max_x != ib->max_x) return (ia->max_x < ib->max_x) ? -1 : 1;
+    if (ia->max_z != ib->max_z) return (ia->max_z < ib->max_z) ? -1 : 1;
     return 0;
 }
 
-static void fill_island_from_region(const TileRegion *r, int scale,
-                                    int world_x0, int world_z0,
-                                    MushroomIsland *out)
+static void fill_island_from_region(const TileRegion *r, const GmifSearchPlan *plan,
+                                    const SearchParams *p, MushroomIsland *out)
 {
-    int min_x = world_x0 + r->min_sx * scale;
-    int max_x = world_x0 + (r->max_sx + 1) * scale - 1;
-    int min_z = world_z0 + r->min_sz * scale;
-    int max_z = world_z0 + (r->max_sz + 1) * scale - 1;
-    out->center_x = (min_x + max_x) / 2;
-    out->center_z = (min_z + max_z) / 2;
-    out->min_x = min_x;
-    out->max_x = max_x;
-    out->min_z = min_z;
-    out->max_z = max_z;
-    out->width = max_x - min_x + 1;
-    out->height = max_z - min_z + 1;
+    int scale = plan->scale;
+    int64_t min_x = plan->world_x0 + (int64_t)r->min_sx * scale;
+    int64_t max_x = plan->world_x0 + (int64_t)(r->max_sx + 1) * scale - 1;
+    int64_t min_z = plan->world_z0 + (int64_t)r->min_sz * scale;
+    int64_t max_z = plan->world_z0 + (int64_t)(r->max_sz + 1) * scale - 1;
+    out->center_x = (int)((min_x + max_x) / 2);
+    out->center_z = (int)((min_z + max_z) / 2);
+    out->min_x = (int)min_x;
+    out->max_x = (int)max_x;
+    out->min_z = (int)min_z;
+    out->max_z = (int)max_z;
+    out->width = (int)(max_x - min_x + 1);
+    out->height = (int)(max_z - min_z + 1);
     out->diagonal_span = sqrt((double)out->width * out->width
                             + (double)out->height * out->height);
     out->samples = r->samples;
@@ -289,12 +316,28 @@ static void fill_island_from_region(const TileRegion *r, int scale,
         if (e < 0) e = 0;
         out->perimeter = (int)(e * scale);
     }
-    out->distance = dist2d((double)out->center_x, (double)out->center_z);
+    out->distance = dist_from_center(out->center_x, out->center_z,
+                                     p->center_x, p->center_z);
     {
         double A = (double)out->area;
         double P = (double)out->perimeter;
         out->compactness = (P > 0) ? (4.0 * 3.141592653589793 * A) / (P * P) : 0.0;
     }
+}
+
+static int64_t tile_refine_upper(const TileRegion *r, int scale)
+{
+    int64_t w = ((int64_t)r->max_sx - r->min_sx + 1) * scale + 4LL * scale;
+    int64_t h = ((int64_t)r->max_sz - r->min_sz + 1) * scale + 4LL * scale;
+    return w * h;
+}
+
+static void free_row_buffers(BorderCell *a, BorderCell *b, BorderCell *c,
+                             BorderCell *d, BorderCell *e,
+                             int *ia, int *ib, int *ic, int *id, int *ie)
+{
+    free(a); free(b); free(c); free(d); free(e);
+    free(ia); free(ib); free(ic); free(id); free(ie);
 }
 
 int gmif_search_tiled(const SearchParams *params,
@@ -308,278 +351,226 @@ int gmif_search_tiled(const SearchParams *params,
     *out = NULL;
     *out_count = 0;
 
+    GmifSearchPlan plan;
+    int rc = gmif_plan_search(params, &plan);
+    if (rc != GMIF_OK) return rc;
+    if (!plan.use_tiles) {
+        /* This public entry always streams, even when the planner would pick
+         * the monolithic path for a small area. */
+        SearchParams forced = *params;
+        forced.use_tiles = 1;
+        rc = gmif_plan_search(&forced, &plan);
+        if (rc != GMIF_OK) return rc;
+    }
+
     SearchCtx ctx;
     ctx.progress = progress;
     ctx.cancel = cancel;
     ctx.ud = userdata;
     ctx.control = control;
     ctx.found = 0;
+    ctx.mode = 1;
 
-    int scale = params->scale > 0 ? params->scale : GMIF_SCALE_CHUNK;
-    if (scale != 1 && scale != 4 && scale != 16 && scale != 64 && scale != 256)
-        scale = GMIF_SCALE_CHUNK;
-    if (params->mc < 0) {
-        return gmif_set_error(GMIF_ERR_VERSION, "invalid Minecraft version id %d", params->mc);
+    if (control) {
+        control->mode = 1;
+        control->percent = 0;
+        control->stage = 4;
+        control->found = 0;
     }
 
-    int half = (params->radius + scale - 1) / scale;
-    int sx = half * 2;
-    int sz = half * 2;
-    int world_x0 = -half * scale;
-    int world_z0 = -half * scale;
-
-    /* Auto tile size in sample cells (bounded memory per tile). */
-    int tile = params->tile_size;
-    if (tile <= 0) {
-        tile = 256;
-        if (scale == 1) tile = 128;
+    int scale = plan.scale;
+    int tile = plan.tile_size;
+    int sx = (int)plan.sx;
+    int sz = (int)plan.sz;
+    if (sx <= 0 || sz <= 0 || tile <= 0) {
+        return gmif_set_error(GMIF_ERR_INVALID_ARG, "invalid tiled scan geometry");
     }
-    if (tile < 8) tile = 8;
-    if (tile > 2048) tile = 2048;
-
-    int nt_x = (sx + tile - 1) / tile;
-    int nt_z = (sz + tile - 1) / tile;
-    int64_t ntiles = (int64_t)nt_x * nt_z;
+    int ntx = (sx + tile - 1) / tile;
+    int ntz = (sz + tile - 1) / tile;
+    int64_t ntiles = (int64_t)ntx * ntz;
+    if (ntx <= 0 || ntz <= 0) {
+        return gmif_set_error(GMIF_ERR_INVALID_ARG, "invalid tile count");
+    }
 
     report(&ctx, 0, "tile");
 
     Generator g;
     setupGenerator(&g, params->mc, 0);
     applySeed(&g, DIM_OVERWORLD, (uint64_t)params->seed);
-    int y = (scale == 1) ? 63 : 15;
 
     TileRegion *regions = NULL;
     int reg_cap = 0, reg_n = 0;
 
-    /* Per-tile: first global region index and count (for border lookup). */
-    int *tile_reg_off = (int *)calloc((size_t)ntiles > 0 ? (size_t)ntiles : 1, sizeof(int));
-    int *tile_reg_cnt = (int *)calloc((size_t)ntiles > 0 ? (size_t)ntiles : 1, sizeof(int));
-    if (!tile_reg_off || !tile_reg_cnt) {
-        free(tile_reg_off); free(tile_reg_cnt);
-        return gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: tile index arrays");
-    }
+    /* One row of border contacts: one slot per (tile, edge cell). */
+    size_t row_cap = (size_t)ntx * (size_t)tile;
+    if (row_cap == 0) row_cap = 1;
+    BorderCell *b_right = (BorderCell *)calloc(row_cap, sizeof(BorderCell));
+    BorderCell *b_left = (BorderCell *)calloc(row_cap, sizeof(BorderCell));
+    BorderCell *b_top = (BorderCell *)calloc(row_cap, sizeof(BorderCell));
+    BorderCell *b_bottom_cur = (BorderCell *)calloc(row_cap, sizeof(BorderCell));
+    BorderCell *b_bottom_prev = (BorderCell *)calloc(row_cap, sizeof(BorderCell));
+    int *n_right = (int *)calloc((size_t)ntx, sizeof(int));
+    int *n_left = (int *)calloc((size_t)ntx, sizeof(int));
+    int *n_top = (int *)calloc((size_t)ntx, sizeof(int));
+    int *n_bottom_cur = (int *)calloc((size_t)ntx, sizeof(int));
+    int *n_bottom_prev = (int *)calloc((size_t)ntx, sizeof(int));
+    unsigned char *mask = (unsigned char *)malloc((size_t)tile * (size_t)tile);
+    int *labels = (int *)malloc((size_t)tile * (size_t)tile * sizeof(int));
 
-    BorderCell *b_right = NULL, *b_left = NULL, *b_bottom = NULL, *b_top = NULL;
-    int cap_r = 0, cap_l = 0, cap_b = 0, cap_t = 0;
-    int n_r = 0, n_l = 0, n_b = 0, n_t = 0;
-    /* Per tile, offsets into border arrays */
-    int *off_r = (int *)calloc((size_t)ntiles, sizeof(int));
-    int *off_l = (int *)calloc((size_t)ntiles, sizeof(int));
-    int *off_b = (int *)calloc((size_t)ntiles, sizeof(int));
-    int *off_t = (int *)calloc((size_t)ntiles, sizeof(int));
-    if (!off_r || !off_l || !off_b || !off_t) {
-        free(tile_reg_off); free(tile_reg_cnt);
-        free(off_r); free(off_l); free(off_b); free(off_t);
-        return gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: border index arrays");
-    }
-
-    unsigned char *mask = (unsigned char *)malloc((size_t)tile * tile);
-    int *labels = (int *)malloc((size_t)tile * tile * sizeof(int));
-    int *biomeIds = NULL;
-    {
-        Range rr;
-        rr.scale = scale;
-        rr.x = 0; rr.z = 0; rr.sx = tile; rr.sz = tile; rr.y = y; rr.sy = 1;
-        biomeIds = allocCache(&g, rr);
-    }
-    if (!mask || !labels || !biomeIds) {
-        free(mask); free(labels); free(biomeIds);
-        free(regions); free(tile_reg_off); free(tile_reg_cnt);
-        free(off_r); free(off_l); free(off_b); free(off_t);
-        free(b_right); free(b_left); free(b_bottom); free(b_top);
+    if (!b_right || !b_left || !b_top || !b_bottom_cur || !b_bottom_prev
+        || !n_right || !n_left || !n_top || !n_bottom_cur || !n_bottom_prev
+        || !mask || !labels) {
+        free_row_buffers(b_right, b_left, b_top, b_bottom_cur, b_bottom_prev,
+                         n_right, n_left, n_top, n_bottom_cur, n_bottom_prev);
+        free(mask); free(labels);
         return gmif_set_error(GMIF_ERR_ALLOC,
-            "allocation failed: tile buffers (tile=%d cells)", tile);
+            "allocation failed: tile buffers (tile=%d, tiles=%lld)",
+            tile, (long long)ntiles);
     }
 
     int64_t done_tiles = 0;
-    int fail = 0;
+    int fail = 0;       /* 1 = native error, 2 = cancelled */
+    int fail_rc = GMIF_OK;
+    int report_stride = (int)(ntiles / 200);
+    if (report_stride < 8) report_stride = 8;
 
-    for (int tz = 0; tz < nt_z && !fail; tz++) {
-        for (int tx = 0; tx < nt_x; tx++) {
+    for (int tz = 0; tz < ntz && !fail; tz++) {
+        for (int tx = 0; tx < ntx; tx++) {
             if (should_stop(&ctx)) { fail = 2; break; }
 
             int x0 = tx * tile;
             int z0 = tz * tile;
             int w = (x0 + tile <= sx) ? tile : (sx - x0);
             int h = (z0 + tile <= sz) ? tile : (sz - z0);
-            int tid = tz * nt_x + tx;
 
-            Range r;
-            r.scale = scale;
-            r.x = -half + x0;
-            r.z = -half + z0;
-            r.sx = w;
-            r.sz = h;
-            r.y = y;
-            r.sy = 1;
-            (void)r;
-
-            if (gmif_fill_mask_range(&g, scale, -half + x0, -half + z0, w, h,
-                                     params->include_shore, mask) != GMIF_OK) {
-                fail = 1;
+            rc = gmif_fill_mask_range(&g, params, scale,
+                                      plan.cell_x0 + x0, plan.cell_z0 + z0,
+                                      w, h, mask, control, -1, -1);
+            if (rc != GMIF_OK) {
+                fail = (rc == GMIF_ERR_CANCELLED) ? 2 : 1;
+                fail_rc = rc;
                 break;
             }
 
             int nloc = 0;
-            if (tile_cca(mask, w, h, labels, &nloc, NULL) != GMIF_OK) {
-                fail = 1;
-                break;
-            }
+            rc = tile_cca(mask, w, h, labels, &nloc);
+            if (rc != GMIF_OK) { fail = 1; fail_rc = rc; break; }
 
-            int reg_base = reg_n;
-            if (grow_regions(&regions, &reg_cap, reg_n + nloc) != GMIF_OK) {
+            if (nloc > GMIF_MAX_REGIONS - reg_n) {
                 fail = 1;
+                fail_rc = gmif_set_error(GMIF_ERR_GRID_TOO_LARGE,
+                    "target biome is too fragmented for a single search:\n"
+                    "  more than %d connected regions would be required.\n"
+                    "  Reduce the radius or use a coarser sample scale.",
+                    GMIF_MAX_REGIONS);
                 break;
             }
+            int reg_base = reg_n;
+            rc = grow_regions(&regions, &reg_cap, reg_n + nloc);
+            if (rc != GMIF_OK) { fail = 1; fail_rc = rc; break; }
             reg_n += nloc;
-            tile_reg_off[tid] = reg_base;
-            tile_reg_cnt[tid] = nloc;
             tile_region_stats(mask, labels, w, h, nloc, x0, z0, regions, reg_base);
 
-            /* Border samples for merge */
-            off_r[tid] = n_r;
+            /* Collect this tile's four edges into the current row buffers. */
+            int base = tx * tile;
             for (int z = 0; z < h; z++) {
                 int lab = labels[z * w + (w - 1)];
                 if (lab <= 0) continue;
-                if (grow_border(&b_right, &cap_r, n_r + 1) != GMIF_OK) { fail = 1; break; }
-                b_right[n_r].region = reg_base + lab - 1;
-                b_right[n_r].coord = z0 + z;
-                n_r++;
+                BorderCell *c = &b_right[base + n_right[tx]++];
+                c->region = reg_base + lab - 1;
+                c->coord = z0 + z;
             }
-            off_l[tid] = n_l;
             for (int z = 0; z < h; z++) {
-                int lab = labels[z * w + 0];
+                int lab = labels[z * w];
                 if (lab <= 0) continue;
-                if (grow_border(&b_left, &cap_l, n_l + 1) != GMIF_OK) { fail = 1; break; }
-                b_left[n_l].region = reg_base + lab - 1;
-                b_left[n_l].coord = z0 + z;
-                n_l++;
+                BorderCell *c = &b_left[base + n_left[tx]++];
+                c->region = reg_base + lab - 1;
+                c->coord = z0 + z;
             }
-            off_b[tid] = n_b;
             for (int x = 0; x < w; x++) {
                 int lab = labels[(h - 1) * w + x];
                 if (lab <= 0) continue;
-                if (grow_border(&b_bottom, &cap_b, n_b + 1) != GMIF_OK) { fail = 1; break; }
-                b_bottom[n_b].region = reg_base + lab - 1;
-                b_bottom[n_b].coord = x0 + x;
-                n_b++;
+                BorderCell *c = &b_bottom_cur[base + n_bottom_cur[tx]++];
+                c->region = reg_base + lab - 1;
+                c->coord = x0 + x;
             }
-            off_t[tid] = n_t;
             for (int x = 0; x < w; x++) {
-                int lab = labels[0 * w + x];
+                int lab = labels[x];
                 if (lab <= 0) continue;
-                if (grow_border(&b_top, &cap_t, n_t + 1) != GMIF_OK) { fail = 1; break; }
-                b_top[n_t].region = reg_base + lab - 1;
-                b_top[n_t].coord = x0 + x;
-                n_t++;
+                BorderCell *c = &b_top[base + n_top[tx]++];
+                c->region = reg_base + lab - 1;
+                c->coord = x0 + x;
             }
 
             done_tiles++;
-            if ((done_tiles & 7) == 0 || done_tiles == ntiles) {
-                int pct = (int)(done_tiles * 80 / ntiles);
-                if (pct > 80) pct = 80;
+            if ((done_tiles % report_stride) == 0 || done_tiles == ntiles) {
+                int pct = (int)(done_tiles * 78 / ntiles);
+                if (pct > 78) pct = 78;
                 report(&ctx, pct, "tile");
             }
         }
+        if (fail) break;
+
+        /* Horizontal merge inside this row. */
+        for (int tx = 0; tx + 1 < ntx; tx++) {
+            int base = tx * tile;
+            merge_border_lists(regions,
+                               &b_right[base], n_right[tx],
+                               &b_left[base + tile], n_left[tx + 1]);
+        }
+        if (should_stop(&ctx)) { fail = 2; break; }
+
+        /* Vertical merge against the previous row. */
+        for (int tx = 0; tx < ntx; tx++) {
+            int base = tx * tile;
+            merge_border_lists(regions,
+                               &b_bottom_prev[base], n_bottom_prev[tx],
+                               &b_top[base], n_top[tx]);
+        }
+        if (should_stop(&ctx)) { fail = 2; break; }
+
+        /* The current bottom becomes the previous bottom for the next row. */
+        BorderCell *tmpc = b_bottom_cur;
+        b_bottom_cur = b_bottom_prev;
+        b_bottom_prev = tmpc;
+        int *tmpn = n_bottom_cur;
+        n_bottom_cur = n_bottom_prev;
+        n_bottom_prev = tmpn;
+
+        /* Reset current-row buffers for the next row. */
+        for (int tx = 0; tx < ntx; tx++) {
+            n_right[tx] = 0;
+            n_left[tx] = 0;
+            n_top[tx] = 0;
+            n_bottom_cur[tx] = 0;
+        }
     }
 
-    free(mask); free(labels); free(biomeIds);
-    if (fail == 2) {
-        free(regions); free(tile_reg_off); free(tile_reg_cnt);
-        free(off_r); free(off_l); free(off_b); free(off_t);
-        free(b_right); free(b_left); free(b_bottom); free(b_top);
+    free(mask);
+    free(labels);
+
+    if (fail) {
+        free(regions);
+        free_row_buffers(b_right, b_left, b_top, b_bottom_cur, b_bottom_prev,
+                         n_right, n_left, n_top, n_bottom_cur, n_bottom_prev);
+        if (fail == 2) return GMIF_ERR_CANCELLED;
+        return fail_rc != GMIF_OK ? fail_rc
+             : gmif_set_error(GMIF_ERR_BIOME_GEN, "tiled scan failed");
+    }
+    if (should_stop(&ctx)) {
+        free(regions);
+        free_row_buffers(b_right, b_left, b_top, b_bottom_cur, b_bottom_prev,
+                         n_right, n_left, n_top, n_bottom_cur, n_bottom_prev);
         return GMIF_ERR_CANCELLED;
     }
-    if (fail) {
-        free(regions); free(tile_reg_off); free(tile_reg_cnt);
-        free(off_r); free(off_l); free(off_b); free(off_t);
-        free(b_right); free(b_left); free(b_bottom); free(b_top);
-        return gmif_set_error(GMIF_ERR_BIOME_GEN, "biome sampling failed inside tiled scan");
-    }
 
-    report(&ctx, 82, "merge");
+    free_row_buffers(b_right, b_left, b_top, b_bottom_cur, b_bottom_prev,
+                     n_right, n_left, n_top, n_bottom_cur, n_bottom_prev);
 
-    /* Merge horizontal neighbors: tile (tx,tz) right with (tx+1,tz) left */
-    for (int tz = 0; tz < nt_z; tz++) {
-        if (should_stop(&ctx)) {
-            free(regions); free(tile_reg_off); free(tile_reg_cnt);
-            free(off_r); free(off_l); free(off_b); free(off_t);
-            free(b_right); free(b_left); free(b_bottom); free(b_top);
-            return GMIF_ERR_CANCELLED;
-        }
-        for (int tx = 0; tx + 1 < nt_x; tx++) {
-            int tA = tz * nt_x + tx;
-            int tB = tz * nt_x + tx + 1;
-            int ar0 = off_r[tA], ar1 = (tx + 1 < nt_x - 1) ? off_r[tA + 1] : n_r;
-            /* end of A's right border = start of next tile's right, or n_r */
-            int nextA = (tA + 1 < ntiles) ? off_r[tA + 1] : n_r;
-            int nextB = (tB + 1 < ntiles) ? off_r[tB + 1] : n_r;
-            (void)nextB;
-            int br0 = off_l[tB];
-            int br1 = (tB + 1 < ntiles) ? off_l[tB + 1] : n_l;
-            (void)ar1;
-            /* Linear merge two sorted-by-coord lists (coords along Z) */
-            int i = ar0, j = br0;
-            int i_end = (tA + 1 < ntiles) ? off_r[tA + 1] : n_r;
-            /* Actually off_* stores START of each tile's chunk in insertion order
-             * (row-major tiles), so end of tile t is start of next tile in that
-             * tile-loop order 锟?which is exactly t+1. */
-            i_end = (tA + 1 <= ntiles - 1) ? off_r[tA + 1] : n_r;
-            /* Wait: off_r[t] is set when tile t is processed; tiles processed in
-             * tz/tx order so off_r[tA]+count = off_r[tA+1] for sequential t.
-             * Yes end = off_r[tA+1] or n_r if last. */
-            while (i < i_end && j < br1) {
-                if (b_right[i].coord == b_left[j].coord) {
-                    int ra = dsu_find(regions, b_right[i].region);
-                    int rb = dsu_find(regions, b_left[j].region);
-                    if (ra != rb) dsu_union(regions, ra, rb);
-                    /* One shared adjacency; attribute once (will be summed on root). */
-                    regions[b_right[i].region].shared_pairs++;
-                    i++; j++;
-                } else if (b_right[i].coord < b_left[j].coord) {
-                    i++;
-                } else {
-                    j++;
-                }
-            }
-            (void)nextA;
-        }
-    }
+    report(&ctx, 80, "merge");
+    report(&ctx, 84, "refine");
 
-    /* Merge vertical neighbors: tile (tx,tz) bottom with (tx,tz+1) top */
-    for (int tz = 0; tz + 1 < nt_z; tz++) {
-        if (should_stop(&ctx)) {
-            free(regions); free(tile_reg_off); free(tile_reg_cnt);
-            free(off_r); free(off_l); free(off_b); free(off_t);
-            free(b_right); free(b_left); free(b_bottom); free(b_top);
-            return GMIF_ERR_CANCELLED;
-        }
-        for (int tx = 0; tx < nt_x; tx++) {
-            int tA = tz * nt_x + tx;
-            int tB = (tz + 1) * nt_x + tx;
-            int i = off_b[tA];
-            int i_end = (tA + 1 < ntiles) ? off_b[tA + 1] : n_b;
-            int j = off_t[tB];
-            int j_end = (tB + 1 < ntiles) ? off_t[tB + 1] : n_t;
-            while (i < i_end && j < j_end) {
-                if (b_bottom[i].coord == b_top[j].coord) {
-                    int ra = dsu_find(regions, b_bottom[i].region);
-                    int rb = dsu_find(regions, b_top[j].region);
-                    if (ra != rb) dsu_union(regions, ra, rb);
-                    regions[b_bottom[i].region].shared_pairs++;
-                    i++; j++;
-                } else if (b_bottom[i].coord < b_top[j].coord) {
-                    i++;
-                } else {
-                    j++;
-                }
-            }
-        }
-    }
-
-    report(&ctx, 90, "refine");
-
-    /* Aggregate roots */
+    /* Aggregate roots. */
     for (int i = 0; i < reg_n; i++) {
         int root = dsu_find(regions, i);
         if (root == i) continue;
@@ -597,29 +588,46 @@ int gmif_search_tiled(const SearchParams *params,
         b->samples = 0; /* consumed */
     }
 
-    /* Collect root regions as islands (all of them; no per-tile TopN). */
     int nroot = 0;
     for (int i = 0; i < reg_n; i++) {
         if (regions[i].samples > 0 && dsu_find(regions, i) == i) nroot++;
     }
-    MushroomIsland *islands = (MushroomIsland *)calloc((size_t)(nroot > 0 ? nroot : 1),
-                                                       sizeof(MushroomIsland));
+    MushroomIsland *islands = (MushroomIsland *)calloc(
+        (size_t)(nroot > 0 ? nroot : 1), sizeof(MushroomIsland));
     if (!islands) {
-        free(regions); free(tile_reg_off); free(tile_reg_cnt);
-        free(off_r); free(off_l); free(off_b); free(off_t);
-        free(b_right); free(b_left); free(b_bottom); free(b_top);
+        free(regions);
         return gmif_set_error(GMIF_ERR_ALLOC, "allocation failed: final island list");
     }
 
     int kept = 0;
+    int processed = 0;
     int fine = params->refine ? (scale > 4 ? 4 : 1) : scale;
     for (int i = 0; i < reg_n; i++) {
+        if (should_stop(&ctx)) {
+            free(regions);
+            free(islands);
+            return GMIF_ERR_CANCELLED;
+        }
         if (regions[i].samples <= 0 || dsu_find(regions, i) != i) continue;
+        processed++;
+        if (nroot > 0 && ((processed & 15) == 0 || processed == nroot)) {
+            int pct = 84 + (int)((int64_t)processed * 14 / nroot);
+            if (pct > 98) pct = 98;
+            report(&ctx, pct, "refine");
+        }
         MushroomIsland isl;
         memset(&isl, 0, sizeof(isl));
-        fill_island_from_region(&regions[i], scale, world_x0, world_z0, &isl);
+        fill_island_from_region(&regions[i], &plan, params, &isl);
         if (params->refine) {
-            gmif_refine_island(&g, scale, fine, params->include_shore, &isl);
+            if (!(params->min_area > 0
+                  && tile_refine_upper(&regions[i], scale) < params->min_area)) {
+                int rrc = gmif_refine_island(&g, params, scale, fine, &isl);
+                if (rrc < 0) {
+                    free(regions);
+                    free(islands);
+                    return rrc;
+                }
+            }
         }
         if (isl.area >= params->min_area) {
             islands[kept++] = isl;
@@ -627,9 +635,7 @@ int gmif_search_tiled(const SearchParams *params,
         }
     }
 
-    free(regions); free(tile_reg_off); free(tile_reg_cnt);
-    free(off_r); free(off_l); free(off_b); free(off_t);
-    free(b_right); free(b_left); free(b_bottom); free(b_top);
+    free(regions);
 
     if (kept > 1)
         qsort(islands, (size_t)kept, sizeof(MushroomIsland), cmp_area_desc);

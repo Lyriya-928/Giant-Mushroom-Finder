@@ -1,6 +1,6 @@
 package dev.sakuhime.mushroomfinder;
 
-/** One discovered mushroom-fields island. */
+/** One discovered connected region of the target biome. */
 public final class SearchResult {
     public final int centerX;
     public final int centerZ;
