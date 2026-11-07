@@ -16,6 +16,7 @@
 #include <math.h>
 
 #include "mushroom_finder.h"
+#include "generator.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -84,6 +85,10 @@ static void usage(void)
         "                      2 desert, 21 jungle, 35 savanna, 37 badlands, 0 ocean)\n"
         "  --refine            Refine candidates at scale 4\n"
         "  --include-shore     Count mushroom_field_shore as island (legacy)\n"
+        "  --exclude-lush-caves  Drop islands that have lush caves (id 175) below\n"
+        "                      them. Requires MC 1.18+ and target biome 14.\n"
+        "  --lush-report       After the search, report for each island whether\n"
+        "                      lush caves generate below it (1.18+)\n"
         "  --dump-region       Print full region statistics\n"
         "  --dump-map          Print ASCII map around largest island\n"
         "  --csv <path>        Export results as CSV\n"
@@ -541,6 +546,7 @@ int main(int argc, char **argv)
     int have_seed = 0;
     int dump_region = 0;
     int dump_map = 0;
+    int lush_report = 0;
     int debug = 0;
     int describe = 0;
     int map_step = 16;
@@ -609,6 +615,10 @@ int main(int argc, char **argv)
             p.refine = 1;
         } else if (!strcmp(argv[i], "--include-shore")) {
             p.include_shore = 1;
+        } else if (!strcmp(argv[i], "--exclude-lush-caves")) {
+            p.exclude_lush_caves = 1;
+        } else if (!strcmp(argv[i], "--lush-report")) {
+            lush_report = 1;
         } else if (!strcmp(argv[i], "--dump-region")) {
             dump_region = 1;
         } else if (!strcmp(argv[i], "--dump-map")) {
@@ -692,9 +702,11 @@ int main(int argc, char **argv)
     fprintf(stderr,
         "Large Biome Finder\n"
         "  seed=%" PRId64 "  version=%s  center=(%d,%d)  radius=%d (half-size)\n"
-        "  min_area=%" PRId64 "  scale=%d  refine=%d  shore=%d  biomes=%d\n\n",
+        "  min_area=%" PRId64 "  scale=%d  refine=%d  shore=%d  biomes=%d\n"
+        "  exclude_lush_caves=%d\n\n",
         p.seed, gmif_mc_to_string(p.mc), p.center_x, p.center_z, p.radius,
-        p.min_area, p.scale, p.refine, p.include_shore, p.biome_count);
+        p.min_area, p.scale, p.refine, p.include_shore, p.biome_count,
+        p.exclude_lush_caves);
 
     MushroomIsland *islands = NULL;
     int count = 0;
@@ -731,6 +743,12 @@ int main(int argc, char **argv)
     else
         printf("Max results (top-N): (all)\n");
     printf("Sample scale: %d%s\n", p.scale, p.refine ? " (refined to 4)" : "");
+    if (p.exclude_lush_caves) {
+        printf("Lush caves exclusion: %s\n",
+               gmif_supports_lush_caves(p.mc) && gmif_targets_mushroom(&p)
+                       ? "ON (islands with lush caves below are dropped)"
+                       : "inactive (needs MC 1.18+ and target biome 14)");
+    }
     if (p.biome_count > 0) {
         printf("Target biomes:");
         for (int i = 0; i < p.biome_count; i++) printf(" %d", p.biome_ids[i]);
@@ -739,6 +757,18 @@ int main(int argc, char **argv)
         printf("Target biomes: %d%s\n", 14, p.include_shore ? " (14,15 shore included)" : " (mushroom fields)");
     }
     printf("\nFound: %d\n\n", count);
+
+    Generator lush_gen;
+    int have_lush_gen = 0;
+    if (lush_report && count > 0) {
+        if (!gmif_supports_lush_caves(p.mc)) {
+            fprintf(stderr, "--lush-report requires Minecraft 1.18 or newer\n");
+        } else {
+            setupGenerator(&lush_gen, p.mc, 0);
+            applySeed(&lush_gen, DIM_OVERWORLD, (uint64_t)p.seed);
+            have_lush_gen = 1;
+        }
+    }
 
     for (int i = 0; i < count; i++) {
         const MushroomIsland *isl = &islands[i];
@@ -769,6 +799,15 @@ int main(int argc, char **argv)
             printf("  Distance from center: %.0f\n", isl->distance);
             printf("  Compactness: %.4f (perimeter approx %d)\n",
                    isl->compactness, isl->perimeter);
+        }
+        if (have_lush_gen) {
+            int lush = gmif_island_has_lush_caves(&lush_gen, &p, isl,
+                                                  NULL, NULL, NULL);
+            if (lush < 0) {
+                printf("  Lush caves below: check failed (%s)\n", gmif_last_error());
+            } else {
+                printf("  Lush caves below: %s\n", lush > 0 ? "yes" : "no");
+            }
         }
         printf("\n");
     }

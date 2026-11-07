@@ -91,6 +91,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
     private final JComboBox<String> scanModeBox = new JComboBox<>();
     private final JComboBox<String> tileSizeBox = new JComboBox<>();
     private final JCheckBox refineCheck = new JCheckBox();
+    private final JCheckBox lushCheck = new JCheckBox();
     private final JComboBox<String> langBox = new JComboBox<>();
     private final JComboBox<String> copyFormatBox = new JComboBox<>();
 
@@ -513,6 +514,11 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         refineCheck.setForeground(FluentTheme.TEXT);
         addFull(card, gc, row++, refineCheck);
 
+        lushCheck.setOpaque(false);
+        lushCheck.setFont(FluentTheme.bodyFont());
+        lushCheck.setForeground(FluentTheme.TEXT);
+        addFull(card, gc, row++, lushCheck);
+
         addFull(card, gc, row++, FluentTheme.hsep());
 
         addFull(card, gc, row++, searchBtn);
@@ -757,6 +763,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         recentBox.addActionListener(e -> applyRecentSelection());
         targetBox.addActionListener(e -> {
             updateTargetFieldState();
+            updateLushState();
             refreshPlan();
         });
         scanModeBox.addActionListener(e -> {
@@ -765,7 +772,10 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         });
         tileSizeBox.addActionListener(e -> refreshPlan());
         threadsBox.addActionListener(e -> refreshPlan());
-        versionBox.addActionListener(e -> refreshPlan());
+        versionBox.addActionListener(e -> {
+            updateLushState();
+            refreshPlan();
+        });
         langBox.addActionListener(e -> switchLanguage());
 
         DocumentListener dl = new DocumentListener() {
@@ -783,6 +793,10 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         minAreaSpinner.addChangeListener(e -> updateActionButtons());
         maxResultsSpinner.addChangeListener(e -> updateActionButtons());
         refineCheck.addActionListener(e -> refreshPlan());
+        lushCheck.addActionListener(e -> {
+            updateLushState();
+            refreshPlan();
+        });
     }
 
     private void schedulePlan() {
@@ -851,6 +865,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         resultTable.setToolTipText(I18n.tipTable());
 
         refineCheck.setText(I18n.refine());
+        lushCheck.setText(I18n.excludeLushCaves());
         searchBtn.setText(I18n.search());
         pauseBtn.setText(runner.isPaused() ? I18n.resume() : I18n.pause());
         stopBtn.setText(I18n.stop());
@@ -908,6 +923,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         tableModel.fireTableDataChanged();
         updateTargetFieldState();
         updateScanFieldState();
+        updateLushState();
         updateActionButtons();
         if (!searching) {
             timeLabel.setText("");
@@ -945,6 +961,49 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         }
     }
 
+    /** True when the selected version has 3D underground biomes (1.18+). */
+    private boolean versionSupportsLush() {
+        Object v = versionBox.getSelectedItem();
+        return v != null && NativeBridge.supportsLushCaves(String.valueOf(v));
+    }
+
+    /** True when the target set contains mushroom fields (id 14). */
+    private boolean targetIsMushroom() {
+        int[] ids = selectedPreset().ids();
+        if (ids == null) {
+            try {
+                ids = parseCustomBiomeIds();
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        if (ids == null) return true;
+        for (int id : ids) {
+            if (id == 14) return true;
+        }
+        return false;
+    }
+
+    /** The lush caves option is only meaningful for mushroom targets. */
+    private boolean lushFilterActive() {
+        return lushCheck.isSelected() && targetIsMushroom();
+    }
+
+    private void updateLushState() {
+        boolean supported = versionSupportsLush();
+        boolean mushroom = targetIsMushroom();
+        lushCheck.setEnabled(!searching && supported && mushroom);
+        String tip;
+        if (!supported) {
+            tip = I18n.errLushNeeds118().replace('\n', ' ');
+        } else if (!mushroom) {
+            tip = I18n.lushOnlyMushroom();
+        } else {
+            tip = I18n.tipLushCaves();
+        }
+        lushCheck.setToolTipText(tip);
+    }
+
     private void updateScanFieldState() {
         boolean tiled = scanModeBox.getSelectedIndex() == 2;
         tileSizeBox.setEnabled(!searching && tiled);
@@ -975,6 +1034,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
             scanModeBox.setSelectedIndex(scanPrefToCombo(prefs.scanMode));
             tileSizeBox.setSelectedIndex(prefs.tileSize <= 0 ? 0 : tileIndexFor(prefs.tileSize));
             refineCheck.setSelected(prefs.refine);
+            lushCheck.setSelected(prefs.excludeLushCaves);
             if (prefs.threads <= 0) threadsBox.setSelectedIndex(0);
             else threadsBox.setSelectedItem(Integer.toString(prefs.threads));
             selectComboItem(langBox, I18n.langDisplayName(I18n.get()));
@@ -985,6 +1045,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         }
         updateTargetFieldState();
         updateScanFieldState();
+        updateLushState();
     }
 
     private static boolean selectComboItem(JComboBox<String> box, String value) {
@@ -1088,6 +1149,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
             prefs.targetMode = BiomePreset.legacyModeFor(prefs.targetPreset);
             prefs.customBiomes = customBiomesField.getText().trim();
             prefs.refine = refineCheck.isSelected();
+            prefs.excludeLushCaves = lushCheck.isSelected();
             prefs.language = I18n.isZh() ? "zh" : "en";
             prefs.save();
         } catch (RuntimeException ignored) {
@@ -1190,6 +1252,11 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         if (!preset.isCustom()) {
             return preset.ids();
         }
+        return parseCustomBiomeIds();
+    }
+
+    /** Parse the custom biome id field; throws on invalid input. */
+    private int[] parseCustomBiomeIds() {
         String raw = customBiomesField.getText().trim();
         if (raw.isEmpty()) throw new NumberFormatException("empty");
         String[] parts = raw.split("[,\\s]+");
@@ -1217,6 +1284,10 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         }
         String version = versionBox.getSelectedItem() == null ? "1.21.3"
                 : String.valueOf(versionBox.getSelectedItem());
+        if (lushFilterActive() && !versionSupportsLush()) {
+            showPlanWarning(I18n.errLushNeeds118().replace('\n', ' '));
+            return;
+        }
         int cx, cz, radius;
         try {
             cx = parseCenterOrThrow(centerXField);
@@ -1235,7 +1306,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         }
         NativeBridge.SearchPlan plan = NativeBridge.plan(
                 version, cx, cz, radius, 16, resolveUseTiles(),
-                resolveTileSize(true), resolveThreads(true));
+                resolveTileSize(true), resolveThreads(true), lushFilterActive());
         if (plan == null) {
             showPlanWarning(I18n.planInvalid(firstLine(safeLastError())));
             lastPlan = null;
@@ -1337,12 +1408,18 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
             return;
         }
         String version = String.valueOf(versionBox.getSelectedItem());
+        if (lushFilterActive() && !versionSupportsLush()) {
+            JOptionPane.showMessageDialog(this, I18n.errLushNeeds118(),
+                    I18n.inputErrorTitle(), JOptionPane.ERROR_MESSAGE);
+            return;
+        }
         int useTiles = resolveUseTiles();
         int tileSize = resolveTileSize(true);
         int threads = resolveThreads(true);
+        boolean excludeLush = lushFilterActive();
 
         NativeBridge.SearchPlan plan = NativeBridge.plan(version, centerX, centerZ,
-                radius, 16, useTiles, tileSize, threads);
+                radius, 16, useTiles, tileSize, threads, excludeLush);
         if (plan == null) {
             showLongError(safeLastError());
             return;
@@ -1358,7 +1435,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         boolean includeShore = "mushroom_shore".equals(preset.id());
         SearchSettings settings = new SearchSettings(
                 seed, version, centerX, centerZ, radius, minArea, 16,
-                refineCheck.isSelected(), includeShore, threads, maxResults,
+                refineCheck.isSelected(), includeShore, excludeLush, threads, maxResults,
                 useTiles, tileSize, biomes);
         lastSettings = settings;
 
@@ -1376,6 +1453,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         prefs.targetMode = BiomePreset.legacyModeFor(prefs.targetPreset);
         prefs.customBiomes = customBiomesField.getText().trim();
         prefs.refine = refineCheck.isSelected();
+        prefs.excludeLushCaves = lushCheck.isSelected();
         prefs.language = I18n.isZh() ? "zh" : "en";
         prefs.pushRecent(encodeRecent(seed, version, centerX, centerZ, radius,
                 preset.id(), customBiomesField.getText().trim()));
@@ -1514,6 +1592,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         tileSizeBox.setEnabled(enabled && scanModeBox.getSelectedIndex() == 2);
         langBox.setEnabled(true);
         copyFormatBox.setEnabled(true);
+        updateLushState();
     }
 
     private void updateActionButtons() {
@@ -1540,6 +1619,7 @@ public final class MainFrame extends JFrame implements SearchRunner.Listener {
         updateActionButtons();
         updateTargetFieldState();
         updateScanFieldState();
+        updateLushState();
         refreshPlan();
     }
 

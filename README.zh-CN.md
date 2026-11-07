@@ -23,6 +23,7 @@ Cubiomes 群系 ID，即可查找面积最大的匹配区域，并查看坐标�
 * 界面直接显示原生实际最大半径（scale 16 下 799,984 格）
 * 按估算面积排序并显示 Top N
 * 可选 16 → 4 精修
+* 可选 **排除下方繁茂洞穴**（1.18+）：岛屿下方出现繁茂洞穴 (175) 时整岛丢弃
 * 原生多线程采样（自动使用物理核心，可手动指定）
 * 自动选择整区域扫描或分块流式扫描
 * 按行流式合并跨 Tile 区域，内存有界
@@ -66,6 +67,18 @@ Cubiomes 生物群系生成
 网格宽度决定，而不是总 Tile 数或总半径（实测 6–30 MB）。搜索开始前，界面会
 显示实际模式、预估峰值内存和原生最大半径。
 
+### 排除下方繁茂洞穴（1.18+，仅蘑菇岛目标）
+
+勾选“排除下方有繁茂洞穴的岛”后，每个蘑菇岛候选在输出前都会再做一次地下检查：
+按 scale 4 重新生成岛屿覆盖范围的掩码，只对属于该岛的列向下采样完整的
+地下高度（y = -64..319，每 4 格一个样本，正好是 1.18+ 群系噪声的垂直分辨率）。
+只要任意一列出现繁茂洞穴（id 175），就**整岛丢弃**——不会拆分区域，也不会
+裁剪结果。检查按行带流式处理（不会分配巨大的三维数组），支持暂停/停止，
+并复用同一组工作线程。
+
+该选项默认关闭，普通搜索完全不受影响；搜索其它群系时该选项不生效；1.18 以前
+的版本没有地下三维群系数据，程序会明确提示不支持并拒绝，而不是用二维数据冒充。
+
 搜索时间仍会随范围增大而增加。`线程数 = 自动` 使用物理核心数（在
 6P+4E 的 i5-13490F 上为 10）；也可以手动填 1–256，结果完全一致。
 
@@ -81,6 +94,9 @@ Cubiomes 生物群系生成
   边界；Tile/区域数量有显式上限；超限请求在分配内存之前就被拒绝。
 * MC 1.17 及更早版本仍需要完整 scale-4 图层窗口（没有 16× 捷径），但同样
   使用多线程和内存有界的流式合并。
+* 排除繁茂洞穴仅支持 1.18+ 且目标包含蘑菇岛 (14)。它会在表面扫描之外再采样
+  一遍地下列：参考机器上 seed 262、半径 10000 时，开启后从 0.84 s 增至
+  1.50 s（10 线程）。
 
 ## 面积与精度
 
@@ -106,7 +122,7 @@ Windows 预编译版本发布在
 * `SHA256SUMS.txt` — 所有产物的校验和
 
 ```powershell
-java -jar LargeBiomeFinder-1.1.0.jar
+java -jar LargeBiomeFinder-1.2.0.jar
 ```
 
 JAR 首次运行时会自动释放内置 DLL，无需额外安装。从源码构建见下文。
@@ -145,7 +161,7 @@ mingw32-make -f Makefile CC=gcc all
 build/
 ├─ gmif_cli.exe
 ├─ gmif.dll          （同时嵌入 JAR）
-└─ LargeBiomeFinder-1.1.0.jar
+└─ LargeBiomeFinder-1.2.0.jar
 ```
 
 ## CLI 示例
@@ -157,6 +173,8 @@ gmif_cli --seed 262 --version 1.18 --center-x -1000 --center-z -1000 --radius 12
 gmif_cli --seed 262 --version 1.18 --radius 600 --biomes 46
 gmif_cli --seed 262 --version 1.18 --radius 5000 --describe
 gmif_cli --seed 262 --version 1.18 --radius 5000 --benchmark
+gmif_cli --seed 262 --version 1.18 --radius 5000 --exclude-lush-caves --refine
+gmif_cli --seed 262 --version 1.18 --radius 5000 --lush-report
 gmif_cli --max-radius
 ```
 
@@ -173,7 +191,7 @@ gmif_cli --max-radius
 ```powershell
 .\build\gmif_cli.exe --audit
 .\build\gmif_cli.exe --self-test
-java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.1.0.jar --self-test
+java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.2.0.jar --self-test
 ```
 
 审计包括：
@@ -189,6 +207,8 @@ java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.1.0.jar 
 * 自动模式切换阈值
 * 原生最大半径可规划、最大半径 +1 被拒绝
 * 全局合并后的 Top-N 排序
+* 排除繁茂洞穴：干净岛屿原样保留、含繁茂洞穴的岛屿整岛丢弃、分块/精修/线程
+  变体结果一致、其它群系目标不受影响、1.17 及更早版本被明确拒绝
 
 GitHub Actions 在 Windows 运行器上对推送和 PR 执行相同的构建、原生 audit
 与 Java self-test。完整实测数据与上限依据见 [PERFORMANCE.md](PERFORMANCE.md)。
@@ -200,14 +220,14 @@ GitHub Actions 在 Windows 运行器上对推送和 PR 执行相同的构建、�
 CLI、DLL、压缩包和 `SHA256SUMS.txt` 发布到 GitHub Releases。
 
 ```powershell
-# 1. 修改 VERSION（例如 1.1.0），提交并合入 main
+# 1. 修改 VERSION（例如 1.2.0），提交并合入 main
 # 2. 打标签并推送
-git tag -a v1.1.0 -m "Large Biome Finder 1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "Large Biome Finder 1.2.0"
+git push origin v1.2.0
 ```
 
 标签必须与 `VERSION` 文件一致，否则工作流在打包阶段直接失败，不会发布
-版本不匹配的产物。本地可用 `.\tools\package-release.ps1 -Tag v1.1.0`
+版本不匹配的产物。本地可用 `.\tools\package-release.ps1 -Tag v1.2.0`
 预演打包（产物在 `build\release\`）。
 
 ## 致谢

@@ -1,6 +1,6 @@
 name: Release
 
-# Push a version tag (for example `v1.1.0`) to build the Windows binaries,
+# Push a version tag (for example `v1.2.0`) to build the Windows binaries,
 # re-run the native audit and Java self-test, and publish a GitHub Release.
 on:
   push:

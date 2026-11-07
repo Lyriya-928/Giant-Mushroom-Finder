@@ -35,6 +35,7 @@ public final class NativeBridge {
             long seed, String version, int centerX, int centerZ,
             int radius, long minArea,
             int scale, boolean refine, boolean includeShore,
+            boolean excludeLushCaves,
             long controlPtr, int threads, int maxResults, int[] biomeIds);
 
     /** out[0]=percent, out[1]=found, out[2]=stage, out[3]=mode (0 mono / 1 tiled). */
@@ -45,6 +46,18 @@ public final class NativeBridge {
 
     /** Native radius ceiling for a sample scale (world-border capped). */
     public static native int nativeMaxRadius(int scale);
+
+    /** True when the version has 3D underground biomes (1.18+). */
+    public static native boolean nativeSupportsLushCaves(String version);
+
+    /** Safe wrapper: false when the native library is unavailable. */
+    public static boolean supportsLushCaves(String version) {
+        try {
+            return nativeSupportsLushCaves(version);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     public static int maxRadius(int scale) {
         try {
@@ -83,7 +96,8 @@ public final class NativeBridge {
                                                   int centerX, int centerZ,
                                                   int radius, int scale,
                                                   int useTiles, int tileSize,
-                                                  int threads);
+                                                  int threads,
+                                                  boolean excludeLushCaves);
 
     public static final int RESULT_STRIDE = 15;
 
@@ -113,8 +127,16 @@ public final class NativeBridge {
     public static SearchPlan plan(String version, int centerX, int centerZ,
                                   int radius, int scale, int useTiles,
                                   int tileSize, int threads) {
+        return plan(version, centerX, centerZ, radius, scale, useTiles,
+                tileSize, threads, false);
+    }
+
+    public static SearchPlan plan(String version, int centerX, int centerZ,
+                                  int radius, int scale, int useTiles,
+                                  int tileSize, int threads,
+                                  boolean excludeLushCaves) {
         long[] a = nativePlanSearch(version, centerX, centerZ, radius, scale,
-                useTiles, tileSize, threads);
+                useTiles, tileSize, threads, excludeLushCaves);
         if (a == null || a.length < 9) return null;
         return new SearchPlan(a[0] != 0, (int) a[1], (int) a[2],
                 a[3], a[4], a[5], a[6], a[7], (int) a[8]);

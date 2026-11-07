@@ -118,6 +118,12 @@ int gmif_is_mushroom(int biome_id, int include_shore)
     return 0;
 }
 
+/** Nonzero when the lush caves filter should run for this search. */
+static int lush_filter_active(const SearchParams *p)
+{
+    return p && p->exclude_lush_caves && gmif_targets_mushroom(p);
+}
+
 /**
  * Coarse grid covers the full block box [center-radius, center+radius] and is
  * aligned to the sample scale.  Cells are aligned so that a search centred on
@@ -263,6 +269,14 @@ static int build_plan(const SearchParams *p, GmifSearchPlan *out)
             return gmif_fail(GMIF_ERR_INVALID_ARG,
                 "invalid biome id %d (supported range 0..255)", p->biome_ids[i]);
         }
+    }
+    if (lush_filter_active(p) && !gmif_supports_lush_caves(p->mc)) {
+        return gmif_fail(GMIF_ERR_VERSION,
+            "excluding islands above lush caves requires Minecraft 1.18 or newer.\n"
+            "  Selected version: %s. Underground (3D) biome generation was added\n"
+            "  in 1.18; the 2D biome data of older versions cannot answer this\n"
+            "  question, so the option is rejected instead of being faked.",
+            gmif_mc_to_string(p->mc));
     }
 
     int sx = 0, sz = 0;
@@ -1116,6 +1130,20 @@ static int search_monolithic(const SearchParams *p, const GmifSearchPlan *plan,
             }
         }
         (void)did_refine;
+
+        /* The lush caves rule drops the whole island, never individual
+         * samples, so the region shape stays exactly as the surface pass
+         * found it. */
+        if (lush_filter_active(p)) {
+            int lush = gmif_island_has_lush_caves(g, p, &isl, ctx->control,
+                                                  ctx->cancel, ctx->ud);
+            if (lush < 0) {
+                free(comps);
+                free(islands);
+                return lush;
+            }
+            if (lush > 0) continue;
+        }
 
         if (isl.area >= p->min_area) {
             islands[kept++] = isl;

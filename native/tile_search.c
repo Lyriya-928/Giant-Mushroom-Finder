@@ -629,6 +629,17 @@ int gmif_search_tiled(const SearchParams *params,
                 }
             }
         }
+        /* Drop the whole merged region when lush caves sit below it. */
+        if (params->exclude_lush_caves && gmif_targets_mushroom(params)) {
+            int lush = gmif_island_has_lush_caves(&g, params, &isl, ctx.control,
+                                                  ctx.cancel, ctx.ud);
+            if (lush < 0) {
+                free(regions);
+                free(islands);
+                return lush;
+            }
+            if (lush > 0) continue;
+        }
         if (isl.area >= params->min_area) {
             islands[kept++] = isl;
             ctx.found = kept;

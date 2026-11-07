@@ -131,6 +131,10 @@ public final class I18n {
     public static String includeShore() {
         return t("计入蘑菇岛岸边群系", "Include mushroom shore biome");
     }
+    public static String excludeLushCaves() {
+        return t("排除下方有繁茂洞穴的岛（1.18+）",
+                "Drop islands above lush caves (1.18+)");
+    }
     public static String scanMode() { return t("扫描模式", "Scan mode"); }
     public static String scanAuto() { return t("自动", "Auto"); }
     public static String scanFull() { return t("整区域", "Full grid"); }
@@ -186,6 +190,29 @@ public final class I18n {
     public static String tipShore() {
         return t("将 mushroom_field_shore 也视为区域的一部分",
                 "Treat mushroom_field_shore as part of the region");
+    }
+    public static String tipLushCaves() {
+        return t("对每个蘑菇岛按其覆盖范围向下检查 scale 4 的三维群系"
+                        + "（y=-64..319，每 4 格采样）；只要下方出现繁茂洞穴 (175)"
+                        + "就整岛丢弃，不会拆分或裁剪岛屿。需要 1.18+，且仅对目标包含"
+                        + "蘑菇岛 (14) 的搜索生效。",
+                "Checks the 3D biomes under each mushroom island at scale 4 "
+                        + "(y=-64..319, every 4 blocks). An island is dropped as a "
+                        + "whole when lush caves (175) appear below it; it is never "
+                        + "split or trimmed. Requires 1.18+ and a target set that "
+                        + "contains mushroom fields (14).");
+    }
+    public static String errLushNeeds118() {
+        return t("「排除下方繁茂洞穴」需要 Minecraft 1.18 或更高版本。\n"
+                        + "旧版本没有地下三维群系数据，无法进行该检查。\n"
+                        + "请切换版本，或取消勾选该选项。",
+                "Excluding islands above lush caves needs Minecraft 1.18 or newer.\n"
+                        + "Underground 3D biome generation does not exist before 1.18.\n"
+                        + "Switch the version or clear the option.");
+    }
+    public static String lushOnlyMushroom() {
+        return t("该选项只对目标包含蘑菇岛 (14) 的搜索生效。",
+                "This option only applies when the target set contains mushroom fields (14).");
     }
     public static String tipThreads() {
         return t("并行采样线程数。自动 = 物理核心数；不改变搜索结果。",

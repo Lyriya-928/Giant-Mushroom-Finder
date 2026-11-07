@@ -36,6 +36,7 @@ public final class UserPrefs {
     public String targetPreset = "mushroom"; // stable id, see BiomePreset
     public String customBiomes = "14";
     public boolean refine = false;
+    public boolean excludeLushCaves = false;
     public String language = "";       // "" = follow system
 
     private final List<String> recent = new ArrayList<>();
@@ -75,6 +76,8 @@ public final class UserPrefs {
                         : (p.targetMode == 2 ? BiomePreset.CUSTOM_ID : "mushroom"));
         p.customBiomes = props.getProperty("customBiomes", p.customBiomes);
         p.refine = Boolean.parseBoolean(props.getProperty("refine", "false"));
+        p.excludeLushCaves = Boolean.parseBoolean(
+                props.getProperty("excludeLushCaves", "false"));
         p.language = props.getProperty("language", p.language);
         for (int i = 0; i < RECENT_MAX; i++) {
             String v = props.getProperty(RECENT_KEY + i);
@@ -149,6 +152,7 @@ public final class UserPrefs {
         props.setProperty("targetPreset", targetPreset == null ? "mushroom" : targetPreset);
         props.setProperty("customBiomes", customBiomes == null ? "" : customBiomes);
         props.setProperty("refine", Boolean.toString(refine));
+        props.setProperty("excludeLushCaves", Boolean.toString(excludeLushCaves));
         props.setProperty("language", language == null ? "" : language);
         for (int i = 0; i < recent.size(); i++) {
             props.setProperty(RECENT_KEY + i, recent.get(i));

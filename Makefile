@@ -45,8 +45,8 @@ all: cli
 
 cli: $(OUT_DIR)/gmif_cli.exe
 
-$(OUT_DIR)/gmif_cli.exe: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a
-	$(CC) -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS) -lpsapi
+$(OUT_DIR)/gmif_cli.exe: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/lush_check.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a
+	$(CC) -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/lush_check.o $(OUT_DIR)/release_audit.o $(OUT_DIR)/mushroom_cli.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS) -lpsapi
 
 $(OUT_DIR)/libcubiomes.a: $(CUBIOMES_OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -60,14 +60,17 @@ $(OUT_DIR)/mushroom_finder.o: $(NATIVE_DIR)/mushroom_finder.c $(NATIVE_DIR)/mush
 $(OUT_DIR)/tile_search.o: $(NATIVE_DIR)/tile_search.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(OUT_DIR)/lush_check.o: $(NATIVE_DIR)/lush_check.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(OUT_DIR)/release_audit.o: $(NATIVE_DIR)/release_audit.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OUT_DIR)/mushroom_cli.o: $(NATIVE_DIR)/mushroom_cli.c $(NATIVE_DIR)/mushroom_finder.h | $(OUT_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OUT_DIR)/gmif.dll: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a
-	$(CC) -shared -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS)
+$(OUT_DIR)/gmif.dll: $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/lush_check.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a
+	$(CC) -shared -o $@ $(OUT_DIR)/mushroom_finder.o $(OUT_DIR)/tile_search.o $(OUT_DIR)/lush_check.o $(OUT_DIR)/mushroom_finder_JNI.o $(OUT_DIR)/libcubiomes.a $(LDFLAGS)
 
 # audit is CLI-only (not linked into DLL)
 
@@ -99,12 +102,12 @@ jar: native $(JAVA_OUT)
 		$(JAVA_SRC)/$(JAVA_PKG)/SearchResult.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/UserPrefs.java \
 		$(JAVA_SRC)/$(JAVA_PKG)/SelfTest.java
-	$(JAR) cfe $(OUT_DIR)/LargeBiomeFinder-1.1.0.jar dev.sakuhime.mushroomfinder.Main \
+	$(JAR) cfe $(OUT_DIR)/LargeBiomeFinder-1.2.0.jar dev.sakuhime.mushroomfinder.Main \
 		-C $(JAVA_OUT) . \
 		-C src/main/resources .
 
 selftest: jar
-	java --enable-native-access=ALL-UNNAMED -cp $(OUT_DIR)/LargeBiomeFinder-1.1.0.jar dev.sakuhime.mushroomfinder.Main --self-test
+	java --enable-native-access=ALL-UNNAMED -cp $(OUT_DIR)/LargeBiomeFinder-1.2.0.jar dev.sakuhime.mushroomfinder.Main --self-test
 
 dist: cli jar
 	@echo Build complete

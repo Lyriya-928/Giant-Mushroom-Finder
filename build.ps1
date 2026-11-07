@@ -73,7 +73,7 @@ $sources = Get-ChildItem "src\main\java\dev\sakuhime\mushroomfinder\*.java" |
 & $JAVAC -encoding UTF-8 -d build\classes $sources
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
-& $JAR cfe build\LargeBiomeFinder-1.1.0.jar dev.sakuhime.mushroomfinder.Main `
+& $JAR cfe build\LargeBiomeFinder-1.2.0.jar dev.sakuhime.mushroomfinder.Main `
     -C build\classes . -C src\main\resources .
 if ($LASTEXITCODE -ne 0) { throw "jar failed" }
 
@@ -89,11 +89,11 @@ if ($LASTEXITCODE -ne 0) { throw "Max radius smoke failed" }
 
 Write-Host "`n== Smoke: Java --self-test (fat JAR) ==" -ForegroundColor Cyan
 & $JAVA '--enable-native-access=ALL-UNNAMED' `
-      '-jar' 'build\LargeBiomeFinder-1.1.0.jar' '--self-test'
+      '-jar' 'build\LargeBiomeFinder-1.2.0.jar' '--self-test'
 if ($LASTEXITCODE -ne 0) { throw "Java self-test failed" }
 
 Write-Host "`nBuild OK" -ForegroundColor Green
 Write-Host "  build\gmif_cli.exe"
 Write-Host "  build\gmif.dll  (also embedded in JAR)"
-Write-Host "  build\LargeBiomeFinder-1.1.0.jar"
-Write-Host "`nRun GUI:  java -jar build\LargeBiomeFinder-1.1.0.jar"
+Write-Host "  build\LargeBiomeFinder-1.2.0.jar"
+Write-Host "`nRun GUI:  java -jar build\LargeBiomeFinder-1.2.0.jar"

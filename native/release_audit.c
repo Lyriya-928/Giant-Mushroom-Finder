@@ -11,6 +11,7 @@
  *   - custom biome target sets
  *   - automatic mode selection near the threshold
  *   - Top-N post-merge filtering
+ *   - lush caves exclusion (1.18+): island drop, version guard, target scope
  */
 #include "mushroom_finder.h"
 
@@ -93,11 +94,12 @@ static int same_islands(const MushroomIsland *a, int na,
     return 1;
 }
 
-static int search(int64_t seed, const char *ver, int center_x, int center_z,
-                  int radius, int scale, int refine, int shore,
-                  const int *biomes, int nbiomes,
-                  int use_tiles, int tile_size, int threads, int max_results,
-                  MushroomIsland **out, int *out_n)
+static int search_ex(int64_t seed, const char *ver, int center_x, int center_z,
+                     int radius, int scale, int refine, int shore,
+                     int exclude_lush,
+                     const int *biomes, int nbiomes,
+                     int use_tiles, int tile_size, int threads, int max_results,
+                     MushroomIsland **out, int *out_n)
 {
     SearchParams p;
     memset(&p, 0, sizeof(p));
@@ -109,6 +111,7 @@ static int search(int64_t seed, const char *ver, int center_x, int center_z,
     p.scale = scale;
     p.refine = refine;
     p.include_shore = shore;
+    p.exclude_lush_caves = exclude_lush;
     p.biome_ids = biomes;
     p.biome_count = nbiomes;
     p.use_tiles = use_tiles;
@@ -118,6 +121,17 @@ static int search(int64_t seed, const char *ver, int center_x, int center_z,
     *out = NULL;
     *out_n = 0;
     return gmif_search(&p, out, out_n, NULL, NULL, NULL, NULL);
+}
+
+static int search(int64_t seed, const char *ver, int center_x, int center_z,
+                  int radius, int scale, int refine, int shore,
+                  const int *biomes, int nbiomes,
+                  int use_tiles, int tile_size, int threads, int max_results,
+                  MushroomIsland **out, int *out_n)
+{
+    return search_ex(seed, ver, center_x, center_z, radius, scale, refine, shore, 0,
+                     biomes, nbiomes, use_tiles, tile_size, threads, max_results,
+                     out, out_n);
 }
 
 static int pair_compare(const char *tag, int64_t seed, const char *ver,
@@ -425,6 +439,148 @@ int gmif_run_release_audit(void)
         ok_pair(pair_compare("seed262 1.21.3 r=1200 refine tile=16",
                         262, "1.21.3", 0, 0, 1200, 16, 1, 0,
                         NULL, 0, 16, 0));
+    }
+
+    section("Lush caves exclusion (1.18+)");
+    {
+        int mc118 = gmif_mc_from_string("1.18");
+        int mc1165 = gmif_mc_from_string("1.16.5");
+        ok(gmif_supports_lush_caves(mc118) == 1, "1.18 has 3D underground biomes");
+        ok(gmif_supports_lush_caves(mc1165) == 0, "1.16.5 has no 3D underground biomes");
+        ok(gmif_supports_lush_caves(gmif_mc_from_string("1.17.1")) == 0,
+           "1.17.1 has no 3D underground biomes");
+
+        /* The option must be rejected before 1.18, never silently ignored. */
+        SearchParams vp;
+        memset(&vp, 0, sizeof(vp));
+        vp.seed = 262;
+        vp.mc = mc1165;
+        vp.radius = 500;
+        vp.scale = 16;
+        vp.exclude_lush_caves = 1;
+        GmifSearchPlan vplan;
+        int vrc = gmif_plan_search(&vp, &vplan);
+        ok(vrc == GMIF_ERR_VERSION, "1.16.5 + exclusion is rejected (rc=%d)", vrc);
+        ok(strstr(gmif_last_error(), "1.18") != NULL,
+           "rejection message explains the 1.18 requirement");
+        vp.mc = mc118;
+        ok(gmif_plan_search(&vp, &vplan) == GMIF_OK, "same plan is valid on 1.18");
+
+        /* Reference search and per-island ground truth (seed 262 r=5000 has a
+         * mix of islands with and without lush caves below them). */
+        Generator lg;
+        setupGenerator(&lg, mc118, 0);
+        applySeed(&lg, DIM_OVERWORLD, 262);
+        SearchParams lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.seed = 262;
+        lp.mc = mc118;
+        lp.radius = 5000;
+        lp.scale = 16;
+        lp.threads = 0;
+        lp.max_results = 0;
+
+        MushroomIsland *all = NULL;
+        int nall = 0;
+        int rc = search_ex(262, "1.18", 0, 0, 5000, 16, 0, 0, 0, NULL, 0,
+                           0, 0, 0, 0, &all, &nall);
+        ok(rc == 0 && nall >= 4, "reference search found %d islands", nall);
+
+        int *lush = (int *)calloc((size_t)(nall > 0 ? nall : 1), sizeof(int));
+        int nlush = 0;
+        for (int i = 0; i < nall; i++) {
+            int r = gmif_island_has_lush_caves(&lg, &lp, &all[i], NULL, NULL, NULL);
+            lush[i] = r > 0 ? 1 : 0;
+            if (lush[i]) nlush++;
+        }
+        ok(nlush >= 1 && nlush < nall,
+           "reference mixes both kinds: %d of %d islands sit above lush caves",
+           nlush, nall);
+
+        MushroomIsland *clean = NULL;
+        int nclean = 0;
+        rc = search_ex(262, "1.18", 0, 0, 5000, 16, 0, 0, 1, NULL, 0,
+                       0, 0, 0, 0, &clean, &nclean);
+        ok(rc == 0 && nclean == nall - nlush,
+           "exclusion keeps exactly the clean islands (%d of %d)", nclean, nall);
+
+        int keep_ok = 1;
+        for (int i = 0; i < nall; i++) {
+            int found = 0;
+            for (int j = 0; j < nclean; j++) {
+                if (all[i].min_x == clean[j].min_x && all[i].max_x == clean[j].max_x
+                    && all[i].min_z == clean[j].min_z && all[i].max_z == clean[j].max_z
+                    && all[i].area == clean[j].area) {
+                    found = 1;
+                    break;
+                }
+            }
+            /* clean islands must survive unchanged; lush islands must be gone */
+            if (found == lush[i]) keep_ok = 0;
+        }
+        ok(keep_ok, "clean islands kept byte-identical, lush islands dropped whole");
+
+        /* The same rule must hold in the tiled streaming path. */
+        MushroomIsland *tiled = NULL;
+        int ntiled = 0;
+        rc = search_ex(262, "1.18", 0, 0, 5000, 16, 0, 0, 1, NULL, 0,
+                       1, 64, 0, 0, &tiled, &ntiled);
+        ok(rc == 0 && same_islands(clean, nclean, tiled, ntiled, "tiled lush"),
+           "tiled streaming drops the same islands (n=%d)", ntiled);
+        free(tiled);
+
+        /* Refine must not change the keep/drop decision. */
+        MushroomIsland *ref_all = NULL, *ref_clean = NULL;
+        int nra = 0, nrc = 0;
+        int r1 = search_ex(262, "1.18", 0, 0, 5000, 16, 1, 0, 0, NULL, 0,
+                           0, 0, 0, 0, &ref_all, &nra);
+        int r2 = search_ex(262, "1.18", 0, 0, 5000, 16, 1, 0, 1, NULL, 0,
+                           0, 0, 0, 0, &ref_clean, &nrc);
+        ok(r1 == 0 && r2 == 0 && nrc == nra - nlush,
+           "refined search drops the same %d islands (%d -> %d)",
+           nlush, nra, nrc);
+        free(ref_all);
+        free(ref_clean);
+
+        /* Thread count must not change the outcome. */
+        MushroomIsland *one = NULL;
+        int none = 0;
+        int r3 = search_ex(262, "1.18", 0, 0, 5000, 16, 0, 0, 1, NULL, 0,
+                           0, 0, 1, 0, &one, &none);
+        ok(r3 == 0 && same_islands(clean, nclean, one, none, "lush threads"),
+           "single-thread exclusion matches the default");
+        free(one);
+
+        /* Other targets must be untouched by the option. */
+        int ocean0[1] = { 0 };
+        MushroomIsland *o_off = NULL, *o_on = NULL;
+        int noff = 0, non = 0;
+        int r4 = search_ex(262, "1.18", -2000, 1000, 2000, 16, 0, 0, 0,
+                           ocean0, 1, 0, 0, 0, 0, &o_off, &noff);
+        int r5 = search_ex(262, "1.18", -2000, 1000, 2000, 16, 0, 0, 1,
+                           ocean0, 1, 0, 0, 0, 0, &o_on, &non);
+        ok(r4 == 0 && r5 == 0 && same_islands(o_off, noff, o_on, non, "lush ocean"),
+           "ocean target is unaffected (%d regions)", noff);
+        free(o_off);
+        free(o_on);
+
+        /* Pause/stop must interrupt the extra pass cleanly. */
+        GmifControl ctl;
+        gmif_control_init(&ctl);
+        ctl.stop = 1;
+        int cand = -1;
+        for (int i = 0; i < nall; i++) {
+            if (lush[i]) { cand = i; break; }
+        }
+        int stop_rc = cand >= 0
+                ? gmif_island_has_lush_caves(&lg, &lp, &all[cand], &ctl, NULL, NULL)
+                : 0;
+        ok(cand >= 0 && stop_rc == GMIF_ERR_CANCELLED,
+           "stop request aborts the lush caves check");
+
+        free(lush);
+        free(all);
+        free(clean);
     }
 
     section("Native search ceiling");

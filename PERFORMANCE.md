@@ -1,11 +1,17 @@
-# Performance & scan strategy (v1.1.0)
+# Performance & scan strategy (v1.2.0)
 
-**中文摘要**：v1.1.0 在上一轮多线程/采样优化的基础上，加入了常用与自定义群系
-目标、产品更名为 Large Biome Finder，并把分块合并改成“按行流式”以去掉随
-Tile 数增长的全量边界数组。分块搜索上限从 20 亿粗采样格提高到 100 亿，
-scale 16 下原生最大半径从约 357,760 格提高到 **799,984 格**；GUI 直接显示
-这个由原生库计算出的值。普通范围仍走整区域扫描，超过 1200 万粗采样格才
-自动切换为分块流式扫描。下文给出可复现的实测数据与边界测试。
+**中文摘要**：v1.2.0 增加了“排除下方繁茂洞穴”筛选：对每个蘑菇岛候选按
+scale 4 重建覆盖范围掩码，只对属于该岛的列向下采样 y = -64..319（每 4 格
+一个样本），任意一处出现繁茂洞穴 (175) 就整岛丢弃。该功能默认关闭，普通
+搜索不受影响；开启后在本机（10 线程）大约增加 0.2–1.6 s，取决于命中岛屿的
+覆盖面积。
+
+v1.1.0 在上一轮多线程/采样优化的基础上，加入了常用与自定义群系目标、产品
+更名为 Large Biome Finder，并把分块合并改成“按行流式”以去掉随 Tile 数增长
+的全量边界数组。分块搜索上限从 20 亿粗采样格提高到 100 亿，scale 16 下原生
+最大半径从约 357,760 格提高到 **799,984 格**；GUI 直接显示这个由原生库计算
+出的值。普通范围仍走整区域扫描，超过 1200 万粗采样格才自动切换为分块流式
+扫描。下文给出可复现的实测数据与边界测试。
 
 ## Test environment
 
@@ -205,6 +211,46 @@ are written to the job summary and uploaded as a workflow artifact. The PR
 checks therefore show the actual build and test outcome, not just a green
 syntax check.
 
+## v1.2.0: lush caves filter (1.18+, mushroom targets)
+
+The new optional pass runs after the surface search and after refinement, once
+per candidate island:
+
+1. Rebuild the island footprint at scale 4 (4×4 blocks per column) with the
+   same target mask as the search. Only columns that belong to the island are
+   considered, so a bounding box that also covers a strait or a neighbouring
+   island cannot create a false positive.
+2. For each covered column, sample the 1.18+ 3D biome noise over
+   y = -64..319 in 4-block steps (96 samples). This matches the vertical
+   resolution Minecraft evaluates underground biomes at; above the surface the
+   depth noise keeps returning the surface biome, so sampling the whole column
+   is both safe and necessary.
+3. The first lush caves sample (id 175) drops the **whole** island. Regions are
+   never split or trimmed, so every kept island is byte-identical to the
+   unfiltered result.
+
+The footprint is streamed in row bands of at most 65,536 mask cells and one
+96-int column buffer per worker, so there is no large 3D allocation. The band
+loop honours pause/stop (checked per band and per row) and the column loop runs
+on the same OpenMP pool as the surface scan.
+
+Measured on the reference machine (seed 262, 1.18, scale 16, top-N = all,
+no refine). The filter is only paid when enabled:
+
+| radius | threads | without filter | with filter | delta |
+|---|---:|---:|---:|---:|
+| 5000 (7 islands, 3 dropped) | 10 | 0.36 s | 0.64 s | +0.28 s |
+| 5000 | 1 | 1.43 s | 3.27 s | +1.84 s |
+| 10000 | 10 | 1.07 s | 1.73 s | +0.66 s |
+| 20000 | 10 | 4.08 s | 5.70 s | +1.62 s |
+| 5000 + refine | 10 | 0.33 s | 0.67 s | +0.34 s |
+
+The cost tracks the total footprint of the candidate islands (96 samples per
+4×4 column), not the search radius itself: a search that finds few islands pays
+almost nothing. The filter never changes the surface mask, the connected
+components or the refinement results, so it cannot slow down or alter a search
+that has it disabled.
+
 ## Reproduce
 
 ```powershell
@@ -217,6 +263,10 @@ java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.1.0.jar 
 
 # native maximum radius for scale 16
 .\build\gmif_cli.exe --max-radius
+
+# lush caves filter: compare with/without, and inspect per-island ground truth
+.\build\gmif_cli.exe --seed 262 --version 1.18 --radius 5000 --exclude-lush-caves
+.\build\gmif_cli.exe --seed 262 --version 1.18 --radius 5000 --lush-report
 
 # thread/time/memory comparison (1..16 threads + auto)
 .\build\gmif_cli.exe --seed 262 --version 1.18 --radius 5000 --benchmark

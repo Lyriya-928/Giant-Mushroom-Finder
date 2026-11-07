@@ -11,6 +11,11 @@ public final class SearchSettings {
     public final int scale;
     public final boolean refine;
     public final boolean includeShore;
+    /**
+     * Drop an island when lush caves generate below it. Only applies to
+     * mushroom-fields targets on 1.18+.
+     */
+    public final boolean excludeLushCaves;
     /** 0 = automatic (physical core count). */
     public final int threads;
     /** Keep top-N by area; 0 = all. */
@@ -25,19 +30,30 @@ public final class SearchSettings {
     public SearchSettings(long seed, String version, int radius, long minArea,
                           int scale, boolean refine, boolean includeShore) {
         this(seed, version, 0, 0, radius, minArea, scale, refine, includeShore,
-                0, 10, 2, 0, null);
+                false, 0, 10, 2, 0, null);
     }
 
     public SearchSettings(long seed, String version, int radius, long minArea,
                           int scale, boolean refine, boolean includeShore,
                           int threads, int maxResults) {
         this(seed, version, 0, 0, radius, minArea, scale, refine, includeShore,
-                threads, maxResults, 2, 0, null);
+                false, threads, maxResults, 2, 0, null);
+    }
+
+    /** Full form without the lush caves option (kept for older callers). */
+    public SearchSettings(long seed, String version, int centerX, int centerZ,
+                          int radius, long minArea, int scale,
+                          boolean refine, boolean includeShore,
+                          int threads, int maxResults, int useTiles, int tileSize,
+                          int[] biomes) {
+        this(seed, version, centerX, centerZ, radius, minArea, scale, refine,
+                includeShore, false, threads, maxResults, useTiles, tileSize, biomes);
     }
 
     public SearchSettings(long seed, String version, int centerX, int centerZ,
                           int radius, long minArea, int scale,
                           boolean refine, boolean includeShore,
+                          boolean excludeLushCaves,
                           int threads, int maxResults, int useTiles, int tileSize,
                           int[] biomes) {
         this.seed = seed;
@@ -49,6 +65,7 @@ public final class SearchSettings {
         this.scale = scale;
         this.refine = refine;
         this.includeShore = includeShore;
+        this.excludeLushCaves = excludeLushCaves;
         this.threads = threads < 0 ? 0 : threads;
         this.maxResults = Math.max(0, maxResults);
         this.useTiles = (useTiles < 0 || useTiles > 2) ? 2 : useTiles;

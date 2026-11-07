@@ -25,6 +25,8 @@ compactness. Search areas are rectangles; this is not a Minecraft mod.
 * Real native maximum radius shown in the GUI (799,984 blocks at scale 16)
 * Top N results sorted by estimated area
 * Optional scale 16 → 4 refinement
+* Optional **lush caves filter** (1.18+): drops a mushroom island entirely when
+  lush caves (id 175) generate below it
 * Parallel native sampling using all physical cores (manual override available)
 * Automatic full-grid vs tiled streaming scan
 * Row-streamed cross-tile merging with bounded memory
@@ -71,6 +73,21 @@ memory depends on tile size and grid width rather than the total radius
 (observed 6–30 MB). The scan mode, estimated peak memory and native maximum
 radius are shown in the GUI before a search.
 
+### Lush caves filter (1.18+, mushroom targets only)
+
+With *Drop islands above lush caves* enabled, each candidate mushroom island is
+checked before it is reported. The island footprint is rebuilt at scale 4 and
+every covered column is sampled over the full underground range
+(y = -64..319, one sample per 4 blocks — the native vertical resolution of the
+1.18+ biome noise). A single lush caves sample (id 175) drops the **whole**
+island: regions are never split and results are never trimmed. The check
+streams the footprint in row bands (no large 3D array), honours pause/stop and
+uses the same worker pool.
+
+The option is off by default, so a normal search is unaffected. Searches for
+other biomes ignore it, and before 1.18 it is rejected with an explicit message
+because those versions have no 3D biome data.
+
 Search time still increases approximately with the searched area. `Threads =
 Auto` uses the number of physical cores (10 on a 6P+4E i5-13490F); manual
 1–256 is available and does not change results.
@@ -89,6 +106,10 @@ Auto` uses the number of physical cores (10 on a 6P+4E i5-13490F); manual
   explicit caps; unsupported requests are rejected before allocation.
 * MC ≤ 1.17 still needs the full scale-4 layer window (no 16× shortcut), but it
   is parallel and uses the same bounded tiled merge.
+* The lush caves filter is 1.18+ and mushroom-target only. It samples the
+  underground column in addition to the surface scan; on the reference machine
+  seed 262 r=10000 went from 0.84 s to 1.50 s with the filter enabled (10
+  threads).
 
 ## Search Accuracy
 
@@ -115,7 +136,7 @@ Prebuilt Windows binaries are published on the
 * `SHA256SUMS.txt` — checksums for all assets
 
 ```powershell
-java -jar LargeBiomeFinder-1.1.0.jar
+java -jar LargeBiomeFinder-1.2.0.jar
 ```
 
 The JAR extracts its embedded DLL on first run, so no separate install step is
@@ -155,7 +176,7 @@ Build outputs:
 build/
 ├─ gmif_cli.exe
 ├─ gmif.dll          (also embedded in the JAR)
-└─ LargeBiomeFinder-1.1.0.jar
+└─ LargeBiomeFinder-1.2.0.jar
 ```
 
 ## CLI examples
@@ -167,6 +188,8 @@ gmif_cli --seed 262 --version 1.18 --center-x -1000 --center-z -1000 --radius 12
 gmif_cli --seed 262 --version 1.18 --radius 600 --biomes 46
 gmif_cli --seed 262 --version 1.18 --radius 5000 --describe
 gmif_cli --seed 262 --version 1.18 --radius 5000 --benchmark
+gmif_cli --seed 262 --version 1.18 --radius 5000 --exclude-lush-caves --refine
+gmif_cli --seed 262 --version 1.18 --radius 5000 --lush-report
 gmif_cli --max-radius
 ```
 
@@ -183,7 +206,7 @@ Common biome ids: `14` Mushroom Fields, `15` Mushroom Shore, `1` Plains,
 ```powershell
 .\build\gmif_cli.exe --audit
 .\build\gmif_cli.exe --self-test
-java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.1.0.jar --self-test
+java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.2.0.jar --self-test
 ```
 
 The audit covers:
@@ -199,6 +222,9 @@ The audit covers:
 * Automatic mode selection near the threshold
 * Native maximum radius accepted, max + 1 rejected
 * Top-N ordering after the global merge
+* Lush caves filter: clean islands kept unchanged, islands with lush caves
+  dropped whole, tiled/refined/thread variants agree, other targets untouched,
+  1.17 and older rejected
 
 GitHub Actions runs the same build, native audit and Java self-test on a
 Windows runner for pushes and pull requests. See [PERFORMANCE.md](PERFORMANCE.md)
@@ -212,15 +238,15 @@ runner, re-runs the native audit and Java self-test, then publishes the JAR,
 CLI, DLL, ZIP and `SHA256SUMS.txt` to GitHub Releases.
 
 ```powershell
-# 1. bump VERSION (for example 1.1.0), commit and merge to main
+# 1. bump VERSION (for example 1.2.0), commit and merge to main
 # 2. tag and push
-git tag -a v1.1.0 -m "Large Biome Finder 1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "Large Biome Finder 1.2.0"
+git push origin v1.2.0
 ```
 
 The tag must match `VERSION`; otherwise the workflow fails at packaging and
 publishes nothing. To dry-run the packaging locally, use
-`.\tools\package-release.ps1 -Tag v1.1.0` (outputs under `build\release\`).
+`.\tools\package-release.ps1 -Tag v1.2.0` (outputs under `build\release\`).
 
 ## Credits
 
