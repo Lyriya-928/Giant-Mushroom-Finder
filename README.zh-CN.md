@@ -3,8 +3,8 @@
 [English](README.md) | 简体中文
 
 一个用于寻找 Minecraft Java Edition **任意群系大型连通区域** 的独立 Java 桌面工具。
-GitHub 仓库名仍保留 `Giant-Mushroom-Finder`，产品显示名已调整为
-**大型群系查找器 / Large Biome Finder**。
+
+仓库地址：<https://github.com/Lyriya-928/Large-Biome-Finder>
 
 输入 Seed、Minecraft 版本、搜索中心与半径，选择常用群系或输入自定义
 Cubiomes 群系 ID，即可查找面积最大的匹配区域，并查看坐标、估算面积、边界、
@@ -94,6 +94,23 @@ Cubiomes 生物群系生成
 程序显示的面积是**估算值**，不是精确的方块数量。精修只改变统计值，
 不改变“哪些连通区域被找到”。
 
+## 下载
+
+Windows 预编译版本发布在
+[Releases](https://github.com/Lyriya-928/Large-Biome-Finder/releases) 页面：
+
+* `LargeBiomeFinder-<version>-windows-x64.zip` — JAR、CLI、DLL 及文档
+* `LargeBiomeFinder-<version>.jar` — 内置原生 DLL 的 GUI / CLI JAR
+* `gmif_cli.exe` — 独立原生命令行工具
+* `gmif.dll` — 供其他程序调用的 JNI 库
+* `SHA256SUMS.txt` — 所有产物的校验和
+
+```powershell
+java -jar LargeBiomeFinder-1.1.0.jar
+```
+
+JAR 首次运行时会自动释放内置 DLL，无需额外安装。从源码构建见下文。
+
 ## Windows 构建
 
 ### 环境要求
@@ -175,6 +192,23 @@ java --enable-native-access=ALL-UNNAMED -jar .\build\LargeBiomeFinder-1.1.0.jar 
 
 GitHub Actions 在 Windows 运行器上对推送和 PR 执行相同的构建、原生 audit
 与 Java self-test。完整实测数据与上限依据见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+## 发布
+
+推送 `v*` 标签即触发 [Release 工作流](.github/workflows/release.yml)：
+在 Windows 运行器上重新构建、跑原生 audit 与 Java self-test，然后把 JAR、
+CLI、DLL、压缩包和 `SHA256SUMS.txt` 发布到 GitHub Releases。
+
+```powershell
+# 1. 修改 VERSION（例如 1.1.0），提交并合入 main
+# 2. 打标签并推送
+git tag -a v1.1.0 -m "Large Biome Finder 1.1.0"
+git push origin v1.1.0
+```
+
+标签必须与 `VERSION` 文件一致，否则工作流在打包阶段直接失败，不会发布
+版本不匹配的产物。本地可用 `.\tools\package-release.ps1 -Tag v1.1.0`
+预演打包（产物在 `build\release\`）。
 
 ## 致谢
 

@@ -3,8 +3,9 @@
 English | [简体中文](README.zh-CN.md)
 
 A standalone Java desktop application for finding large connected regions of
-**any biome** in Minecraft Java Edition. The GitHub repository name is kept as
-`Giant-Mushroom-Finder` for history; the product is now **Large Biome Finder**.
+**any biome** in Minecraft Java Edition.
+
+Repository: <https://github.com/Lyriya-928/Large-Biome-Finder>
 
 Enter a seed, Minecraft version, search centre and radius, then choose a common
 biome preset or enter custom Cubiomes biome ids. The app reports the largest
@@ -102,6 +103,24 @@ boundaries. The reported area is an estimate, not an exact block count.
 Every result is the largest matching connected component; refinement does not
 change which regions are found, only their reported statistics.
 
+## Download
+
+Prebuilt Windows binaries are published on the
+[Releases](https://github.com/Lyriya-928/Large-Biome-Finder/releases) page:
+
+* `LargeBiomeFinder-<version>-windows-x64.zip` — JAR, CLI, DLL and docs
+* `LargeBiomeFinder-<version>.jar` — GUI / CLI JAR with the native DLL embedded
+* `gmif_cli.exe` — standalone native CLI
+* `gmif.dll` — JNI library for embedding
+* `SHA256SUMS.txt` — checksums for all assets
+
+```powershell
+java -jar LargeBiomeFinder-1.1.0.jar
+```
+
+The JAR extracts its embedded DLL on first run, so no separate install step is
+needed. Building from source is described below.
+
 ## Building on Windows
 
 ### Requirements
@@ -184,6 +203,24 @@ The audit covers:
 GitHub Actions runs the same build, native audit and Java self-test on a
 Windows runner for pushes and pull requests. See [PERFORMANCE.md](PERFORMANCE.md)
 for the full measured results.
+
+## Releasing
+
+Pushing a `v*` tag triggers the
+[Release workflow](.github/workflows/release.yml): it rebuilds on a Windows
+runner, re-runs the native audit and Java self-test, then publishes the JAR,
+CLI, DLL, ZIP and `SHA256SUMS.txt` to GitHub Releases.
+
+```powershell
+# 1. bump VERSION (for example 1.1.0), commit and merge to main
+# 2. tag and push
+git tag -a v1.1.0 -m "Large Biome Finder 1.1.0"
+git push origin v1.1.0
+```
+
+The tag must match `VERSION`; otherwise the workflow fails at packaging and
+publishes nothing. To dry-run the packaging locally, use
+`.\tools\package-release.ps1 -Tag v1.1.0` (outputs under `build\release\`).
 
 ## Credits
 

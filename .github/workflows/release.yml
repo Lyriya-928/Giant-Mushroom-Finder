@@ -1,0 +1,92 @@
+name: Release
+
+# Push a version tag (for example `v1.1.0`) to build the Windows binaries,
+# re-run the native audit and Java self-test, and publish a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install MinGW-w64 and make
+        shell: powershell
+        run: |
+          choco install mingw -y --no-progress
+          $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                      [Environment]::GetEnvironmentVariable('Path','User') + ';' +
+                      $env:Path
+          if (-not (Get-Command mingw32-make -ErrorAction SilentlyContinue) -and
+              -not (Get-Command make -ErrorAction SilentlyContinue)) {
+            choco install make -y --no-progress
+            $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
+                        [Environment]::GetEnvironmentVariable('Path','User') + ';' +
+                        $env:Path
+          }
+          gcc --version
+          $make = Get-Command mingw32-make -ErrorAction SilentlyContinue
+          if (-not $make) { $make = Get-Command make -ErrorAction SilentlyContinue }
+          if (-not $make) { throw "No make executable found" }
+          & $make.Source --version
+
+      - name: Build, native audit and Java self-test
+        shell: powershell
+        run: .\tools\ci-windows.ps1
+
+      - name: Package release assets
+        shell: powershell
+        run: .\tools\package-release.ps1 -Tag ${{ github.ref_name }}
+
+      - name: Publish GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d') { throw "Refusing to publish from non-version ref: $tag" }
+          $assets = Get-Content "build\release\assets.txt"
+          gh release create $tag @assets `
+            --title "Large Biome Finder $tag" `
+            --notes-file "build\release\release-notes.md" `
+            --verify-tag
+
+      - name: Job summary
+        if: always()
+        shell: powershell
+        run: |
+          if (Test-Path "build\release\release-notes.md") {
+            Get-Content "build\release\release-notes.md" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }
+
+      - name: Upload release artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LargeBiomeFinder-release
+          path: |
+            build/release/*
+            build/ci-*.log
+          if-no-files-found: warn
+          retention-days: 30
