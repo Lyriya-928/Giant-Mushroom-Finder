@@ -47,13 +47,16 @@ $zip = Join-Path $dist "$stageName.zip"
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
 
 $assets = @($zip, $jar, 'build\gmif_cli.exe', 'build\gmif.dll')
-$assets | Set-Content -Path (Join-Path $dist 'assets.txt') -Encoding ASCII
 
 $hashLines = foreach ($path in $assets) {
     $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
     "{0}  {1}" -f $hash, (Split-Path -Leaf $path)
 }
 $hashLines | Set-Content -Path (Join-Path $dist 'SHA256SUMS.txt') -Encoding ASCII
+
+# Publish the checksum file alongside the binaries it describes.
+$assets += Join-Path $dist 'SHA256SUMS.txt'
+$assets | Set-Content -Path (Join-Path $dist 'assets.txt') -Encoding ASCII
 
 function Last-Match([string]$path, [string]$pattern, [string]$fallback) {
     if (Test-Path -LiteralPath $path) {
@@ -105,7 +108,11 @@ Native maximum radius at scale 16: **$maxRadius** blocks.
 See ``PERFORMANCE.md`` in the repository for measured bottlenecks and scan-mode details.
 "@
 
-$notes | Set-Content -Path (Join-Path $dist 'release-notes.md') -Encoding UTF8
+# UTF-8 without BOM: a BOM would leak into the rendered release body.
+[System.IO.File]::WriteAllText(
+    (Join-Path $dist 'release-notes.md'),
+    $notes,
+    (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "Packaged $Tag"
 Get-ChildItem -LiteralPath $dist -File | ForEach-Object {
