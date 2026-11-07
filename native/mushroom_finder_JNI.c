@@ -24,6 +24,7 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
     jlong seed, jstring version, jint centerX, jint centerZ,
     jint radius, jlong minArea,
     jint scale, jboolean refine, jboolean includeShore,
+    jboolean excludeLushCaves,
     jlong controlPtr, jint threads, jint maxResults, jintArray biomeIds)
 {
     (void)cls;
@@ -68,6 +69,7 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
     p.scale = (int)scale;
     p.refine = refine ? 1 : 0;
     p.include_shore = includeShore ? 1 : 0;
+    p.exclude_lush_caves = excludeLushCaves ? 1 : 0;
     p.threads = threads >= 0 ? (int)threads : 0;
     if (p.threads > 256) p.threads = 256;
     p.max_results = maxResults > 0 ? (int)maxResults : 0;
@@ -130,7 +132,8 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSearch(
 }
 
 /*
- * nativePlanSearch(version, centerX, centerZ, radius, scale, useTiles, tileSize, threads)
+ * nativePlanSearch(version, centerX, centerZ, radius, scale, useTiles, tileSize,
+ *                  threads, excludeLushCaves)
  * -> long[9] = {mode, tileSize, threads, sx, sz, cells, estSamples, estPeakBytes, scale}
  * or null on invalid input (message in last error).
  */
@@ -138,7 +141,8 @@ JNIEXPORT jlongArray JNICALL
 Java_dev_sakuhime_mushroomfinder_NativeBridge_nativePlanSearch(
     JNIEnv *env, jclass cls,
     jstring version, jint centerX, jint centerZ, jint radius,
-    jint scale, jint useTiles, jint tileSize, jint threads)
+    jint scale, jint useTiles, jint tileSize, jint threads,
+    jboolean excludeLushCaves)
 {
     (void)cls;
     const char *vchars = (*env)->GetStringUTFChars(env, version, NULL);
@@ -160,6 +164,7 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativePlanSearch(
     p.use_tiles = (int)useTiles;
     p.tile_size = (int)tileSize;
     p.threads = (int)threads;
+    p.exclude_lush_caves = excludeLushCaves ? 1 : 0;
 
     GmifSearchPlan plan;
     int rc = gmif_plan_search(&p, &plan);
@@ -194,6 +199,21 @@ Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeMaxRadius(
 {
     (void)env; (void)cls;
     return gmif_max_radius((int)scale);
+}
+
+/** Nonzero if the version has 3D underground biomes (1.18+). */
+JNIEXPORT jboolean JNICALL
+Java_dev_sakuhime_mushroomfinder_NativeBridge_nativeSupportsLushCaves(
+    JNIEnv *env, jclass cls, jstring version)
+{
+    (void)cls;
+    if (!version) return JNI_FALSE;
+    const char *vchars = (*env)->GetStringUTFChars(env, version, NULL);
+    if (!vchars) return JNI_FALSE;
+    int mc = gmif_mc_from_string(vchars);
+    (*env)->ReleaseStringUTFChars(env, version, vchars);
+    if (mc < 0) return JNI_FALSE;
+    return gmif_supports_lush_caves(mc) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL

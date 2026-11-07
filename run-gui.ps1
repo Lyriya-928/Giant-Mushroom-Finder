@@ -7,7 +7,7 @@ Set-Location $root
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
             [Environment]::GetEnvironmentVariable('Path','User')
 
-$jar = Join-Path $root "build\LargeBiomeFinder-1.1.0.jar"
+$jar = Join-Path $root "build\LargeBiomeFinder-1.2.0.jar"
 if (-not (Test-Path $jar)) {
     $found = Get-ChildItem "build\*Finder*.jar" -ErrorAction SilentlyContinue |
              Select-Object -First 1 -ExpandProperty FullName

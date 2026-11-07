@@ -143,6 +143,67 @@ final class SelfTest {
             }
         }
 
+        System.out.println("== Lush caves exclusion (1.18+) ==");
+        expect(NativeBridge.supportsLushCaves("1.18"), "1.18 supports 3D biomes");
+        expect(NativeBridge.supportsLushCaves("1.21.3"), "1.21.3 supports 3D biomes");
+        expect(!NativeBridge.supportsLushCaves("1.16.5"), "1.16.5 has no 3D biomes");
+        expect(NativeBridge.plan("1.16.5", 0, 0, 500, 16, 2, 0, 0, true) == null,
+                "1.16.5 + exclusion is rejected by the plan");
+        expect(NativeBridge.nativeGetLastErrorCode() == NativeBridge.ERR_VERSION,
+                "rejection code is ERR_VERSION");
+        expect(NativeBridge.plan("1.16.5", 0, 0, 500, 16, 2, 0, 0, false) != null,
+                "1.16.5 without exclusion still plans");
+
+        Outcome lushOff = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 5000, 0L, 16, false, false, false, 0, 0, 2, 0, null));
+        Outcome lushOn = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 5000, 0L, 16, false, false, true, 0, 0, 2, 0, null));
+        if (lushOff.error != null || lushOn.error != null) {
+            expect(false, "lush search error: " + lushOff.error + " / " + lushOn.error);
+        } else {
+            int no = lushOff.results.size();
+            int nn = lushOn.results.size();
+            expect(no == 7, "seed 262 r=5000 finds 7 islands without the filter (got " + no + ")");
+            expect(nn == 4, "the filter drops the 3 islands above lush caves (got " + nn + ")");
+            boolean subset = true;
+            for (SearchResult kept : lushOn.results) {
+                boolean found = false;
+                for (SearchResult ref : lushOff.results) {
+                    if (kept.centerX == ref.centerX && kept.centerZ == ref.centerZ
+                            && kept.area == ref.area) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) subset = false;
+            }
+            expect(subset, "every kept island is unchanged (no split, no trimming)");
+        }
+
+        System.out.println("== Lush exclusion leaves other targets alone ==");
+        int[] oceanTarget = {46};
+        Outcome ocOff = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 600, 0L, 16, false, false, false, 0, 0, 2, 0,
+                oceanTarget));
+        Outcome ocOn = runSearch(new SearchSettings(
+                262L, "1.18", 0, 0, 600, 0L, 16, false, false, true, 0, 0, 2, 0,
+                oceanTarget));
+        if (ocOff.error != null || ocOn.error != null) {
+            expect(false, "ocean search error: " + ocOff.error + " / " + ocOn.error);
+        } else {
+            expect(ocOff.results.size() == ocOn.results.size(),
+                    "cold-ocean target returns identical results (" + ocOn.results.size() + ")");
+            boolean same = true;
+            for (int i = 0; i < ocOff.results.size(); i++) {
+                SearchResult a = ocOff.results.get(i);
+                SearchResult b = ocOn.results.get(i);
+                if (a.centerX != b.centerX || a.centerZ != b.centerZ || a.area != b.area) {
+                    same = false;
+                }
+            }
+            expect(same, "non-mushroom results are byte-identical");
+        }
+
         System.out.println("========================================");
         if (failures == 0) {
             System.out.println("SELF-TEST PASS");

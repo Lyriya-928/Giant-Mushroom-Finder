@@ -192,7 +192,7 @@ public final class SearchRunner {
             try {
                 flat = NativeBridge.nativeSearch(
                         s.seed, s.version, s.centerX, s.centerZ, s.radius, s.minArea,
-                        s.scale, s.refine, s.includeShore, controlPtr,
+                        s.scale, s.refine, s.includeShore, s.excludeLushCaves, controlPtr,
                         s.threads, s.maxResults, s.biomes);
             } catch (UnsatisfiedLinkError e) {
                 finishError("Native library is out of date (missing " + e.getMessage()

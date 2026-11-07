@@ -1,6 +1,6 @@
 # Package Windows release assets and release notes for a version tag.
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Tag v1.1.0
+#   powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package-release.ps1 -Tag v1.2.0
 #
 # Requires a completed build (run .\build.ps1 or .\tools\ci-windows.ps1 first).
 # Outputs, all under build\release\:

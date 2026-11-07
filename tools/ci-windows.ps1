@@ -35,7 +35,7 @@ try {
 
     Write-Host "`n== Java self-test ==" -ForegroundColor Cyan
     & $javaExe '--enable-native-access=ALL-UNNAMED' `
-          '-jar' 'build\LargeBiomeFinder-1.1.0.jar' '--self-test' |
+          '-jar' 'build\LargeBiomeFinder-1.2.0.jar' '--self-test' |
         Tee-Object -FilePath build\ci-selftest.log
     if ($LASTEXITCODE -ne 0) { throw "Java self-test failed (exit $LASTEXITCODE)" }
 
@@ -51,7 +51,7 @@ try {
     $summary = @"
 ## Large Biome Finder Windows CI: $status
 
-- Build: build\LargeBiomeFinder-1.1.0.jar
+- Build: build\LargeBiomeFinder-1.2.0.jar
 - Native max radius (scale 16): $maxRadius
 - Native audit: see ci-audit.log
 - Java self-test: see ci-selftest.log

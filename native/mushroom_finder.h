@@ -15,7 +15,7 @@
 #define MUSHROOM_FINDER_H_
 
 /** Application version (keep in sync with /VERSION and Java AppInfo). */
-#define GMIF_VERSION "1.1.0"
+#define GMIF_VERSION "1.2.0"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -71,6 +71,12 @@ typedef struct SearchParams {
     int     scale;         /* coarse sample scale (16 recommended) */
     int     refine;        /* 0 = coarse only, 1 = refine candidates */
     int     include_shore; /* legacy: also count mushroom_field_shore */
+    /**
+     * 1 = drop an island entirely when lush caves generate below its
+     * footprint. Applies only when the target set contains mushroom_fields
+     * (id 14) and the Minecraft version has 3D biome generation (1.18+).
+     */
+    int     exclude_lush_caves;
     int     threads;       /* worker threads; 0 = auto (physical cores) */
     int     max_results;   /* keep top-N by area after sort; 0 = all */
     /* 0 = monolithic (legacy full-grid), 1 = tiled streaming, 2 = auto */
@@ -140,6 +146,11 @@ int  gmif_control_wait_if_paused(GmifControl *c);
  *
  * `control` may be NULL. `cancel` may be NULL. `params->threads == 0`
  * selects the physical-core default.
+ *
+ * When `params->exclude_lush_caves` is set and the target set contains
+ * mushroom_fields, every candidate island is additionally checked for lush
+ * caves below its footprint (see gmif_island_has_lush_caves) and dropped as a
+ * whole when one is found. Other targets are unaffected.
  */
 int gmif_search(const SearchParams *params,
                 MushroomIsland **out, int *out_count,
@@ -272,6 +283,43 @@ int gmif_is_target(int biome_id, const SearchParams *params);
 
 /** Nonzero if biome id is mushroom_fields (or shore if include_shore). */
 int gmif_is_mushroom(int biome_id, int include_shore);
+
+/* ------------------------------------------------------------------ */
+/* lush caves exclusion (MC 1.18+)                                     */
+/* ------------------------------------------------------------------ */
+
+/** Cubiomes id of the lush caves biome (1.18+). */
+#define GMIF_BIOME_LUSH_CAVES 175
+
+/** Nonzero if the MC version has 3D (underground) biome generation. */
+int gmif_supports_lush_caves(int mc);
+
+/** Nonzero if the search target set contains mushroom_fields (id 14). */
+int gmif_targets_mushroom(const SearchParams *params);
+
+/** Horizontal/vertical grid used by the lush caves check (documentation). */
+#define GMIF_LUSH_SAMPLE_SCALE 4
+#define GMIF_LUSH_Y4_MIN (-16) /* block y = -64 */
+#define GMIF_LUSH_Y4_MAX (79)  /* block y = 316..319 */
+
+/**
+ * Check whether lush caves (id 175) generate below an island footprint.
+ *
+ * The footprint is rebuilt at scale 4 (4x4 blocks per column) from the same
+ * target mask as the search, so only columns that belong to the island are
+ * tested. Each column is sampled over the full underground height
+ * (block y -64..319) in 4-block steps, i.e. at the native vertical resolution
+ * of the 1.18+ biome noise. Columns are processed in row bands, so the working
+ * set is bounded (no full 3D array is ever allocated).
+ *
+ * Returns 1 if lush caves were found (the island must be dropped), 0 if the
+ * island is clean, or a negative GMIF_ERR_* value (GMIF_ERR_VERSION before
+ * 1.18, GMIF_ERR_CANCELLED when paused/stopped). `control` may be NULL.
+ */
+int gmif_island_has_lush_caves(const void *generator, const SearchParams *params,
+                               const MushroomIsland *island,
+                               GmifControl *control, CancelFn cancel,
+                               void *userdata);
 
 /**
  * Dump an ASCII map of mushroom coverage for a world rect.
