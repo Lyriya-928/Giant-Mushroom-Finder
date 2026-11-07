@@ -63,6 +63,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # The runner injects $ErrorActionPreference = 'Stop', which turns
+          # gh's stderr ("release not found") into a terminating error. Handle
+          # exit codes explicitly instead.
+          $ErrorActionPreference = 'Continue'
           $tag = "${{ github.ref_name }}"
           if ($tag -notmatch '^v\d') { throw "Refusing to publish from non-version ref: $tag" }
           $title = "Large Biome Finder $tag"
